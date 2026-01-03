@@ -1,6 +1,6 @@
 {
   "name": "@case/summary-analyzer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Compare AI-generated legal document summaries across multiple LLM models",
   "private": true,
   "scripts": {

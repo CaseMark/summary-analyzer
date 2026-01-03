@@ -165,10 +165,14 @@ export default function RootLayout({
                 </nav>
 
                 {/* Footer */}
-                <div className="p-4 border-t border-border">
+                <div className="p-4 border-t border-border space-y-2">
                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
                     <BarChart3 className="h-3.5 w-3.5" />
                     <span>Judge Model: GPT-5.2</span>
+                  </div>
+                  <div className="flex items-center justify-between text-[10px] text-muted-foreground/60">
+                    <span>v1.1.0</span>
+                    <span className="font-mono">2026-01-03</span>
                   </div>
                 </div>
               </aside>
