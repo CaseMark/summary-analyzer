@@ -74,6 +74,7 @@ import {
   getVaultPresignedUrl,
   generateCaseMarkSummary,
   checkAndDownloadCaseMarkSummary,
+  downloadCaseMarkResult,
   type CaseMarkWorkflowType,
 } from '@/lib/case-api';
 import { debugLogger } from '@/lib/debug-logger';
@@ -259,8 +260,28 @@ export default function MatterDetailPage({
 
   // Start processing if needed
   useEffect(() => {
-    if (shouldStart && matter && matter.status === 'created' && !processing) {
+    // Allow starting if:
+    // 1. URL has ?start=true (shouldStart)
+    // 2. Matter exists
+    // 3. Not already processing in this session
+    // 4. Matter status allows it (created, processing, or analyzing but not completed)
+    const canStart = shouldStart && matter && !processing && matter.status !== 'completed';
+    
+    if (canStart) {
+      console.log('[StartProcessing] Starting processing...', {
+        matterStatus: matter.status,
+        shouldStart,
+        processing,
+        existingSummaries: Object.keys(matter.summaries || {}).length,
+      });
       startProcessing();
+    } else if (shouldStart && matter) {
+      console.log('[StartProcessing] Cannot start - conditions not met:', {
+        matterStatus: matter.status,
+        shouldStart,
+        processing,
+        canStart,
+      });
     }
   }, [shouldStart, matter, processing]);
 
@@ -296,6 +317,11 @@ export default function MatterDetailPage({
   // Track which models are currently being retried
   const [retryingModels, setRetryingModels] = useState<Set<string>>(new Set());
   const [runningAnalysis, setRunningAnalysis] = useState(false);
+  
+  // Track analysis progress more granularly
+  const [extractingModels, setExtractingModels] = useState<Set<string>>(new Set());
+  const [analyzingModels, setAnalyzingModels] = useState<Set<string>>(new Set());
+  const [analysisProgress, setAnalysisProgress] = useState<{ current: number; total: number; currentModel: string } | null>(null);
 
   // Retry a single model's summary - MUST use CaseMark API, never raw LLM
   const retrySingleModel = async (modelId: string) => {
@@ -366,6 +392,14 @@ export default function MatterDetailPage({
           model.outputPricePer1M
         );
 
+        // Use actual API stats if available, otherwise estimate
+        const hasActualStats = !!(result.data.inputTokens && result.data.outputTokens && result.data.costUsd);
+        const statsEstimated = !hasActualStats;
+        
+        if (statsEstimated) {
+          addLogEntry('warning', `⚠️ ${model.name}: Using estimated stats (API didn't return actual usage)`);
+        }
+        
         newSummary = {
           model: model.id,
           content: result.data.content,
@@ -377,8 +411,9 @@ export default function MatterDetailPage({
           createdAt: new Date().toISOString(),
           status: 'completed',
           casemarkWorkflowId: result.data.workflowId,
+          statsEstimated,
         };
-        addLogEntry('success', `${model.name} completed via CaseMark`, `${(elapsedTime / 1000).toFixed(1)}s`);
+        addLogEntry('success', `${model.name} completed via CaseMark`, `${(elapsedTime / 1000).toFixed(1)}s • ${statsEstimated ? '~' : ''}$${newSummary.costUsd.toFixed(4)}`);
         
         toast({
           title: 'Summary generated',
@@ -440,10 +475,16 @@ export default function MatterDetailPage({
   // Check status of a workflow that may have completed after we lost connection
   // FAST: Just checks status, doesn't download or extract text
   const checkWorkflowStatus = async (modelId: string) => {
-    if (!matter) return;
+    console.log(`[CHECK] checkWorkflowStatus called for ${modelId}`);
+    
+    if (!matter) {
+      console.log(`[CHECK] No matter object`);
+      return;
+    }
     
     const summary = matter.summaries[modelId];
     if (!summary?.casemarkWorkflowId) {
+      console.log(`[CHECK] No workflow ID for ${modelId}`);
       toast({
         title: 'No workflow ID',
         description: 'Cannot check status - no workflow ID saved.',
@@ -455,35 +496,68 @@ export default function MatterDetailPage({
     const model = TEST_MODELS.find(m => m.id === modelId);
     const workflowId = summary.casemarkWorkflowId;
     
+    console.log(`[CHECK] Checking ${model?.name || modelId} workflow ${workflowId}`);
+    
     setRetryingModels(prev => new Set(prev).add(modelId));
-    addLogEntry('info', `⚡ Quick status check for ${model?.name || modelId}...`);
+    addLogEntry('info', `🔍 Checking ${model?.name || modelId}...`);
 
     try {
       // FAST: Just check status - skip slow text extraction
       const result = await checkAndDownloadCaseMarkSummary(
         workflowId,
-        (status) => addLogEntry('info', `   └─ ${status}`),
+        (status) => {
+          console.log(`[CHECK] ${model?.name}: ${status}`);
+          addLogEntry('info', `   └─ ${status}`);
+        },
         true // skipDownload = true for instant check!
       );
       
+      console.log(`[CHECK] Result for ${model?.name}:`, result.data?.casemarkStatus, result.error);
+      
       // Check if CaseMark workflow completed (even if download failed)
       const casemarkCompleted = result.data?.casemarkStatus === 'COMPLETED';
-      const hasContent = result.data?.content && result.data.content.length > 0;
+      // Note: '[CONTENT_NOT_EXTRACTED]' is a placeholder returned when skipDownload=true
+      const hasContent = result.data?.content && 
+                        result.data.content.length > 0 && 
+                        result.data.content !== '[CONTENT_NOT_EXTRACTED]';
+      
+      // Log what we found
+      addLogEntry('info', `   └─ Status: ${result.data?.casemarkStatus || 'UNKNOWN'} | Content: ${hasContent ? 'Yes' : 'No'}`);
+      
+      if (!casemarkCompleted && !result.error) {
+        // Still running - show clear feedback
+        addLogEntry('info', `   └─ ⏳ ${model?.name || modelId}: Still RUNNING on CaseMark`);
+        toast({
+          title: 'Still processing',
+          description: `${model?.name || modelId} is still running on CaseMark. Check back in a minute.`,
+        });
+        setRetryingModels(prev => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
+        });
+        return;
+      }
       
       if (!casemarkCompleted && result.error) {
-        // Still in progress or failed on CaseMark side
-        addLogEntry('error', `${model?.name || modelId} still failed: ${result.error}`);
+        // Error or not started
+        addLogEntry('error', `   └─ ❌ ${model?.name || modelId}: ${result.error}`);
         toast({
-          title: 'Still not complete',
-          description: result.error || 'Workflow has not completed yet.',
+          title: 'Error',
+          description: result.error || 'Failed to check status.',
           variant: 'destructive',
+        });
+        setRetryingModels(prev => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
         });
         return;
       }
       
       if (casemarkCompleted && !hasContent) {
-        // CaseMark finished but we couldn't download the file
-        addLogEntry('warning', `${model?.name || modelId}: CaseMark COMPLETED but download failed`);
+        // CaseMark finished but we didn't download the file (because skipDownload=true)
+        addLogEntry('success', `   └─ ${model?.name || modelId}: COMPLETED ✓ (ready to download)`);
         
         const updatedSummary: SummaryResult = {
           ...summary,
@@ -568,6 +642,435 @@ export default function MatterDetailPage({
     }
   };
 
+  // Refresh all stuck jobs - check status and download any completed summaries
+  const [refreshingAll, setRefreshingAll] = useState(false);
+  const [refreshProgress, setRefreshProgress] = useState<{ current: number; total: number; modelName: string } | null>(null);
+  
+  const refreshAllJobs = async () => {
+    if (!matter || refreshingAll) return;
+    
+    setRefreshingAll(true);
+    setRefreshProgress({ current: 0, total: 0, modelName: 'Starting...' });
+    addLogEntry('info', '🔄 REFRESH ALL: Checking all jobs and downloading completed summaries...');
+    
+    toast({
+      title: 'Refreshing All Jobs',
+      description: 'Checking status and downloading completed summaries...',
+      duration: 3000,
+    });
+    
+    const selectedModels = matter.modelsToTest 
+      ? TEST_MODELS.filter(m => matter.modelsToTest!.includes(m.id))
+      : TEST_MODELS;
+    
+    let downloadedCount = 0;
+    let stillRunningCount = 0;
+    let errorCount = 0;
+    let alreadyDoneCount = 0;
+    
+    setRefreshProgress({ current: 0, total: selectedModels.length, modelName: 'Checking...' });
+    
+    try {
+      for (let i = 0; i < selectedModels.length; i++) {
+        const model = selectedModels[i];
+        const summary = matter.summaries[model.id];
+        
+        // Update progress
+        setRefreshProgress({ current: i + 1, total: selectedModels.length, modelName: model.name });
+        
+        // Skip if no workflow ID
+        if (!summary?.casemarkWorkflowId) {
+          addLogEntry('info', `   ⏭️ ${model.name}: No workflow ID, skipping`);
+          continue;
+        }
+        
+        // Check if already fully downloaded with content
+        const hasContent = summary.content && summary.content.length > 100;
+        if (summary.status === 'completed' && hasContent) {
+          alreadyDoneCount++;
+          addLogEntry('info', `   ✓ ${model.name}: Already downloaded (${summary.content.length.toLocaleString()} chars)`);
+          continue;
+        }
+        
+        // NEEDS CHECK: ANY summary that isn't fully downloaded - including errors!
+        // The summary might have completed on CaseMark even if our download timed out
+        const needsDownload = 
+          summary.status === 'completed_no_download' || 
+          summary.status === 'error' ||  // ← ALSO check errored summaries!
+          summary.status === 'generating' ||  // ← Check if still generating
+          summary.casemarkStatus === 'COMPLETED' ||
+          !hasContent;  // ← Any summary without content
+        
+        if (needsDownload) {
+          // Step 1: Check status on CaseMark first
+          addLogEntry('info', `🔍 ${model.name}: Checking CaseMark status...`);
+          setRefreshProgress({ current: i + 1, total: selectedModels.length, modelName: `Checking ${model.name}...` });
+          
+          let workflowDurationMs = summary.elapsedTimeMs || 0;
+          let actualCost = summary.costUsd || 0;
+          let actualInputTokens = summary.inputTokens || 0;
+          let actualOutputTokens = summary.outputTokens || 0;
+          let casemarkStatus = summary.casemarkStatus;
+          
+          try {
+            const statusResult = await checkAndDownloadCaseMarkSummary(summary.casemarkWorkflowId, undefined, true);
+            if (statusResult.data) {
+              casemarkStatus = statusResult.data.casemarkStatus;
+              workflowDurationMs = statusResult.data.casemarkDurationMs || statusResult.data.elapsedMs || workflowDurationMs;
+              actualCost = statusResult.data.costUsd || actualCost;
+              actualInputTokens = statusResult.data.inputTokens || actualInputTokens;
+              actualOutputTokens = statusResult.data.outputTokens || actualOutputTokens;
+            }
+          } catch (e) {
+            addLogEntry('warning', `   └─ ${model.name}: Status check failed - ${e}`);
+          }
+          
+          // If not completed on CaseMark, skip download
+          if (casemarkStatus !== 'COMPLETED') {
+            addLogEntry('info', `   └─ ${model.name}: Status = ${casemarkStatus || 'UNKNOWN'} (not ready)`);
+            if (casemarkStatus === 'RUNNING' || casemarkStatus === 'QUEUED') {
+              stillRunningCount++;
+            }
+            continue;
+          }
+          
+          // Log that CaseMark summary is ready with timing
+          const timeStr = workflowDurationMs > 0 ? ` (${(workflowDurationMs / 1000).toFixed(1)}s)` : '';
+          addLogEntry('success', `📋 ${model.name}: COMPLETED on CaseMark${timeStr}`);
+          
+          // Step 2: Start download
+          setRefreshProgress({ current: i + 1, total: selectedModels.length, modelName: `Downloading ${model.name}...` });
+          addLogEntry('info', `📥 ${model.name}: Downloading PDF...`);
+          
+          try {
+            const downloadResult = await Promise.race([
+              downloadCaseMarkResult(summary.casemarkWorkflowId, 'PDF'),
+              new Promise<never>((_, reject) => 
+                setTimeout(() => reject(new Error('Download timeout (5 min)')), 300000)
+              )
+            ]);
+            
+            if (downloadResult.data && downloadResult.data.length > 100) {
+              const content = downloadResult.data;
+              const hasActualStats = actualInputTokens > 0 && actualCost > 0;
+              const estimatedTokens = Math.ceil(content.length / 4);
+              const estimatedCost = calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M);
+              
+              setMatter(prev => {
+                if (!prev) return prev;
+                const updatedSummaries = {
+                  ...prev.summaries,
+                  [model.id]: {
+                    ...prev.summaries[model.id],
+                    content,
+                    status: 'completed' as const,
+                    casemarkStatus: 'COMPLETED' as const,
+                    elapsedTimeMs: workflowDurationMs,
+                    inputTokens: hasActualStats ? actualInputTokens : estimatedTokens,
+                    outputTokens: hasActualStats ? actualOutputTokens : estimatedTokens,
+                    totalTokens: hasActualStats ? (actualInputTokens + actualOutputTokens) : estimatedTokens * 2,
+                    costUsd: hasActualStats ? actualCost : estimatedCost,
+                    statsEstimated: !hasActualStats,
+                  },
+                };
+                const updated = { ...prev, summaries: updatedSummaries, updatedAt: new Date().toISOString() };
+                saveMatter(updated);
+                return updated;
+              });
+              
+              downloadedCount++;
+              // Step 3: Log extraction complete with timing
+              const costStr = hasActualStats ? `$${actualCost.toFixed(4)}` : `~$${estimatedCost.toFixed(4)}`;
+              addLogEntry('success', `✅ ${model.name}: ${content.length.toLocaleString()} chars | ${costStr} | ${(workflowDurationMs / 1000).toFixed(1)}s`);
+            } else {
+              addLogEntry('warning', `⚠️ ${model.name}: Download returned empty/small content`);
+              errorCount++;
+            }
+          } catch (dlError) {
+            const errorMsg = dlError instanceof Error ? dlError.message : 'Unknown error';
+            addLogEntry('error', `❌ ${model.name}: Download failed - ${errorMsg}`);
+            errorCount++;
+          }
+          continue;
+        }
+        
+        // Check CaseMark status for jobs that might be done
+        addLogEntry('info', `🔍 ${model.name}: Checking CaseMark status...`);
+        
+        try {
+          const result = await checkAndDownloadCaseMarkSummary(
+            summary.casemarkWorkflowId,
+            undefined,
+            true // skipDownload for quick status check
+          );
+          
+          const casemarkStatus = result.data?.casemarkStatus;
+          
+          if (casemarkStatus === 'COMPLETED') {
+            // Get timing and cost data from the status result
+            const workflowDurationMs = result.data?.casemarkDurationMs || result.data?.elapsedMs || 0;
+            const actualCost = result.data?.costUsd || summary.costUsd || 0;
+            const actualInputTokens = result.data?.inputTokens || summary.inputTokens || 0;
+            const actualOutputTokens = result.data?.outputTokens || summary.outputTokens || 0;
+            
+            // Step 1: Log with timing
+            const timeStr = workflowDurationMs > 0 ? ` (${(workflowDurationMs / 1000).toFixed(1)}s)` : '';
+            addLogEntry('success', `📋 ${model.name}: Summary COMPLETED${timeStr}`);
+            addLogEntry('info', `📥 ${model.name}: Downloading PDF...`);
+            
+            try {
+              const downloadResult = await Promise.race([
+                downloadCaseMarkResult(summary.casemarkWorkflowId, 'PDF'),
+                new Promise<never>((_, reject) => 
+                  setTimeout(() => reject(new Error('Download timeout')), 300000)
+                )
+              ]);
+              
+              if (downloadResult.data && downloadResult.data.length > 100) {
+                const content = downloadResult.data;
+                const hasActualStats = actualInputTokens > 0 && actualCost > 0;
+                const estimatedTokens = Math.ceil(content.length / 4);
+                const estimatedCost = calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M);
+                
+                setMatter(prev => {
+                  if (!prev) return prev;
+                  const updatedSummaries = {
+                    ...prev.summaries,
+                    [model.id]: {
+                      ...prev.summaries[model.id],
+                      content,
+                      status: 'completed' as const,
+                      casemarkStatus: 'COMPLETED' as const,
+                      elapsedTimeMs: workflowDurationMs,
+                      inputTokens: hasActualStats ? actualInputTokens : estimatedTokens,
+                      outputTokens: hasActualStats ? actualOutputTokens : estimatedTokens,
+                      totalTokens: hasActualStats ? (actualInputTokens + actualOutputTokens) : estimatedTokens * 2,
+                      costUsd: hasActualStats ? actualCost : estimatedCost,
+                      statsEstimated: !hasActualStats,
+                    },
+                  };
+                  const updated = { ...prev, summaries: updatedSummaries, updatedAt: new Date().toISOString() };
+                  saveMatter(updated);
+                  return updated;
+                });
+                
+                downloadedCount++;
+                // Log with actual stats
+                const costStr = hasActualStats ? `$${actualCost.toFixed(4)}` : `~$${estimatedCost.toFixed(4)}`;
+                addLogEntry('success', `✅ ${model.name}: ${content.length.toLocaleString()} chars | ${costStr} | ${(workflowDurationMs / 1000).toFixed(1)}s`);
+              }
+            } catch (dlError) {
+              addLogEntry('error', `❌ ${model.name}: Download/extraction failed`);
+              // Mark as completed_no_download
+              setMatter(prev => {
+                if (!prev) return prev;
+                const updated = {
+                  ...prev,
+                  summaries: {
+                    ...prev.summaries,
+                    [model.id]: { ...prev.summaries[model.id], status: 'completed_no_download' as const, casemarkStatus: 'COMPLETED' as const },
+                  },
+                  updatedAt: new Date().toISOString(),
+                };
+                saveMatter(updated);
+                return updated;
+              });
+              errorCount++;
+            }
+          } else if (casemarkStatus === 'RUNNING' || casemarkStatus === 'QUEUED') {
+            stillRunningCount++;
+            addLogEntry('info', `⏳ ${model.name}: Still ${casemarkStatus} on CaseMark (waiting...)`);
+          } else if (casemarkStatus === 'FAILED') {
+            addLogEntry('error', `❌ ${model.name}: Summary FAILED on CaseMark`);
+            setMatter(prev => {
+              if (!prev) return prev;
+              const updated = {
+                ...prev,
+                summaries: {
+                  ...prev.summaries,
+                  [model.id]: { ...prev.summaries[model.id], status: 'error' as const, error: 'CaseMark workflow failed', casemarkStatus: 'FAILED' as const },
+                },
+                updatedAt: new Date().toISOString(),
+              };
+              saveMatter(updated);
+              return updated;
+            });
+            errorCount++;
+          } else {
+            addLogEntry('warning', `❓ ${model.name}: Unknown status: ${casemarkStatus}`);
+          }
+        } catch (error) {
+          addLogEntry('warning', `⚠️ ${model.name}: Status check failed`);
+        }
+      }
+      
+      // Summary
+      const totalProcessed = downloadedCount + stillRunningCount + errorCount + alreadyDoneCount;
+      addLogEntry('success', `🔄 REFRESH COMPLETE: ${downloadedCount} downloaded, ${alreadyDoneCount} already done, ${stillRunningCount} still running, ${errorCount} errors`);
+      
+      toast({
+        title: 'Refresh Complete',
+        description: `Downloaded ${downloadedCount} summaries${stillRunningCount > 0 ? `, ${stillRunningCount} still running` : ''}${errorCount > 0 ? `, ${errorCount} errors` : ''}`,
+        duration: 3000,
+      });
+      
+      // AUTO-START ANALYSIS: If we downloaded any summaries, start quality analysis
+      if (downloadedCount > 0 || alreadyDoneCount > 0) {
+        const completedWithoutAnalysis = selectedModels.filter(m => {
+          const s = matter.summaries[m.id];
+          const q = matter.qualityScores[m.id];
+          return s?.status === 'completed' && s?.content && s.content.length > 100 && !q;
+        });
+        
+        if (completedWithoutAnalysis.length > 0) {
+          addLogEntry('info', `═══════════════════════════════════════════════════`);
+          addLogEntry('info', `🤖 AUTO-STARTING QUALITY ANALYSIS`);
+          addLogEntry('info', `   ${completedWithoutAnalysis.length} summaries ready for GPT-5.2 evaluation:`);
+          completedWithoutAnalysis.forEach((m, idx) => {
+            addLogEntry('info', `   ${idx + 1}. ${m.name}`);
+          });
+          addLogEntry('info', `═══════════════════════════════════════════════════`);
+          // Small delay to let state settle, then trigger analysis
+          setTimeout(() => {
+            runQualityAnalysis();
+          }, 500);
+        }
+      }
+      
+    } catch (error) {
+      addLogEntry('error', `🔄 Refresh failed: ${error instanceof Error ? error.message : 'Error'}`);
+      toast({
+        title: 'Refresh failed',
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: 'destructive',
+      });
+    } finally {
+      setRefreshingAll(false);
+      setRefreshProgress(null);
+    }
+  };
+
+  // Download and extract content for a completed summary
+  const downloadSummaryContent = async (modelId: string) => {
+    if (!matter) return;
+    
+    const summary = matter.summaries[modelId];
+    if (!summary?.casemarkWorkflowId) {
+      toast({
+        title: 'Cannot download',
+        description: 'No workflow ID available for this summary.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    
+    const model = TEST_MODELS.find(m => m.id === modelId);
+    const modelName = model?.name || modelId;
+    const workflowId = summary.casemarkWorkflowId;
+    
+    setRetryingModels(prev => new Set(prev).add(modelId));
+    addLogEntry('info', `📥 Downloading ${modelName}... (this may take a few minutes)`);
+    
+    try {
+      // 5 minute timeout for download + text extraction
+      const timeoutMs = 300000;
+      const timeoutPromise = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error(`Download timeout after ${Math.round(timeoutMs/1000)}s`)), timeoutMs)
+      );
+      
+      const startTime = Date.now();
+      
+      toast({
+        title: 'Downloading...',
+        description: `${modelName}: Extracting text from PDF (may take 2-5 minutes)`,
+      });
+      
+      const downloadResult = await Promise.race([
+        downloadCaseMarkResult(workflowId, 'PDF'),
+        timeoutPromise
+      ]);
+      
+      const elapsed = Date.now() - startTime;
+      
+      if (downloadResult.error) {
+        addLogEntry('error', `${modelName} download failed: ${downloadResult.error}`);
+        toast({
+          title: 'Download failed',
+          description: downloadResult.error,
+          variant: 'destructive',
+        });
+        return;
+      }
+      
+      if (!downloadResult.data || downloadResult.data.length < 100) {
+        addLogEntry('error', `${modelName} returned empty or too short content`);
+        toast({
+          title: 'Download failed',
+          description: 'Empty or too short content returned',
+          variant: 'destructive',
+        });
+        return;
+      }
+      
+      // Calculate stats
+      const content = downloadResult.data;
+      const hasActualStats = !!(summary.inputTokens && summary.inputTokens > 0 && summary.costUsd && summary.costUsd > 0);
+      const estimatedTokens = Math.ceil(content.length / 4);
+      const estimatedCost = model ? calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M) : 0;
+      
+      const updatedSummary: SummaryResult = {
+        ...summary,
+        content,
+        status: 'completed',
+        inputTokens: hasActualStats ? summary.inputTokens : estimatedTokens,
+        outputTokens: hasActualStats ? summary.outputTokens : estimatedTokens,
+        totalTokens: hasActualStats ? summary.totalTokens : estimatedTokens * 2,
+        costUsd: hasActualStats ? summary.costUsd : estimatedCost,
+        statsEstimated: !hasActualStats,
+      };
+      
+      setMatter(prev => {
+        if (!prev) return prev;
+        const updated = {
+          ...prev,
+          summaries: { ...prev.summaries, [modelId]: updatedSummary },
+          updatedAt: new Date().toISOString(),
+        };
+        saveMatter(updated);
+        return updated;
+      });
+      
+      addLogEntry('success', `✅ ${modelName} downloaded: ${content.length.toLocaleString()} chars in ${Math.round(elapsed/1000)}s`);
+      toast({
+        title: 'Download complete!',
+        description: `${modelName}: ${content.length.toLocaleString()} characters extracted`,
+      });
+      
+      // AUTO-START ANALYSIS for this summary if not already analyzed
+      if (!matter.qualityScores[modelId]) {
+        addLogEntry('info', `🔍 Auto-starting analysis for ${modelName}...`);
+        setTimeout(() => {
+          analyzeSingleSummary(modelId);
+        }, 500);
+      }
+      
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      addLogEntry('error', `${modelName} download failed: ${errorMsg}`);
+      toast({
+        title: 'Download failed',
+        description: errorMsg,
+        variant: 'destructive',
+      });
+    } finally {
+      setRetryingModels(prev => {
+        const next = new Set(prev);
+        next.delete(modelId);
+        return next;
+      });
+    }
+  };
+
   // Run quality analysis on completed summaries (both API-generated and uploaded PDFs)
   const runQualityAnalysis = async () => {
     if (!matter) return;
@@ -585,19 +1088,20 @@ export default function MatterDetailPage({
     // CRITICAL: This extracted text is the source of truth for quality scoring
     let documentContent = matter.sourceDocuments[0]?.content || '';
     
-    // If no content yet, we need to extract it from the vault
+    // If no content yet, we need to extract it from the vault using Gemini Vision
     if (!documentContent && matter.vaultId && matter.sourceDocuments[0]?.objectId) {
-      addLogEntry('info', '📄 Extracting source text for quality analysis (this is the source of truth)');
-      setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, status: 'running', detail: 'Running OCR extraction...' } : s));
+      addLogEntry('info', '📄 Extracting source text with Gemini Vision (this is the source of truth for quality analysis)');
+      setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, status: 'running', detail: 'Initializing Gemini Vision...' } : s));
       
-      const { extractTextFromVaultObject } = await import('@/lib/case-api');
+      // Use Gemini Vision for more accurate extraction of legal documents
+      const { extractVaultObjectWithGemini } = await import('@/lib/case-api');
       
-      const extractResult = await extractTextFromVaultObject(
+      const extractResult = await extractVaultObjectWithGemini(
         matter.vaultId,
         matter.sourceDocuments[0].objectId,
         (status) => {
           setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, detail: status } : s));
-          addLogEntry('info', `OCR: ${status}`);
+          addLogEntry('info', `Gemini: ${status}`);
         }
       );
       
@@ -629,8 +1133,8 @@ export default function MatterDetailPage({
         updatedAt: new Date().toISOString(),
       } : prev);
       
-      addLogEntry('success', `✅ Source text extracted: ${documentContent.length.toLocaleString()} chars, ${extractResult.data.pageCount || '?'} pages`);
-      setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, status: 'completed', detail: `${documentContent.length.toLocaleString()} chars extracted` } : s));
+      addLogEntry('success', `✅ Gemini Vision extracted source: ${documentContent.length.toLocaleString()} chars, ${extractResult.data.pageCount || '?'} pages`);
+      setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, status: 'completed', detail: `${documentContent.length.toLocaleString()} chars via Gemini Vision` } : s));
     } else if (documentContent) {
       setSteps(prev => prev.map(s => s.id === 'extract' ? { ...s, status: 'completed', detail: 'Using cached content' } : s));
       addLogEntry('info', `Using cached source content: ${documentContent.length.toLocaleString()} chars`);
@@ -646,25 +1150,31 @@ Summary Type: ${matter.summaryType}
     }
 
     // Determine what summaries we need to analyze (API-generated summaries)
-    type SummaryToAnalyze = { modelId: string; modelName: string; content: string };
+    // Include both 'completed' and 'completed_no_download' - we'll extract content as needed
+    type SummaryToAnalyze = { modelId: string; modelName: string; content: string; needsExtraction: boolean; workflowId?: string };
     
-    const completedSummaries = Object.values(matter.summaries).filter(
-      (s) => s.status === 'completed' && s.content
+    const readySummaries = Object.values(matter.summaries).filter(
+      (s) => (s.status === 'completed' || s.status === 'completed_no_download') && 
+             !matter.qualityScores[s.model] // Not yet analyzed
     );
-    const summariesToAnalyze: SummaryToAnalyze[] = completedSummaries
-      .filter(s => !matter.qualityScores[s.model])
-      .map(s => {
-        const model = TEST_MODELS.find(m => m.id === s.model);
-        return {
-          modelId: s.model,
-          modelName: model?.name || s.model,
-          content: s.content,
-        };
-      });
-    console.log(`[Quality Analysis] Analyzing ${summariesToAnalyze.length} summaries`);
+    
+    // Build list - some may need content extraction first
+    const summariesToAnalyze: SummaryToAnalyze[] = readySummaries.map(s => {
+      const model = TEST_MODELS.find(m => m.id === s.model);
+      const hasRealContent = s.content && s.content.length > 100 && s.content !== '[CONTENT_NOT_EXTRACTED]';
+      return {
+        modelId: s.model,
+        modelName: model?.name || s.model,
+        content: hasRealContent ? s.content : '',
+        needsExtraction: !hasRealContent && !!s.casemarkWorkflowId,
+        workflowId: s.casemarkWorkflowId,
+      };
+    });
+    
+    console.log(`[Quality Analysis] ${summariesToAnalyze.length} summaries to analyze (${summariesToAnalyze.filter(s => s.needsExtraction).length} need extraction)`);
 
     if (summariesToAnalyze.length === 0) {
-      toast({ title: 'No summaries to analyze', description: 'All summaries have already been analyzed.' });
+      toast({ title: 'No summaries to analyze', description: 'All summaries have already been analyzed or are not ready.' });
       setRunningAnalysis(false);
       return;
     }
@@ -673,10 +1183,20 @@ Summary Type: ${matter.summaryType}
     
     // Start analysis phase
     setSteps(prev => prev.map(s => s.id === 'analyze' ? { ...s, status: 'running', progress: 0 } : s));
+    setAnalysisProgress({ current: 0, total: summariesToAnalyze.length, currentModel: '' });
 
     for (let i = 0; i < summariesToAnalyze.length; i++) {
-      const summary = summariesToAnalyze[i];
+      let summary = summariesToAnalyze[i];
       const progress = ((i + 1) / summariesToAnalyze.length) * 100;
+      
+      // Track which model is being analyzed - UPDATE BOTH states for UI
+      setAnalyzingModels(prev => new Set([...prev, summary.modelId]));
+      setAnalysisModelId(summary.modelId); // This drives the "Analyzing..." UI in Quality Analysis section
+      setCurrentModelStartTime(Date.now()); // Reset timer for this model
+      setAnalysisProgress({ current: i + 1, total: summariesToAnalyze.length, currentModel: summary.modelName });
+      
+      // Update activity banner to show which model is being analyzed
+      addLogEntry('info', `🔍 Analyzing ${summary.modelName}...`);
       
       setSteps(prev => prev.map(s => s.id === 'analyze' ? {
         ...s,
@@ -684,6 +1204,64 @@ Summary Type: ${matter.summaryType}
         progress,
         detail: `Analyzing ${summary.modelName} (${i + 1}/${summariesToAnalyze.length})`,
       } : s));
+
+      // Extract content if needed
+      if (summary.needsExtraction && summary.workflowId) {
+        addLogEntry('info', `📥 Extracting ${summary.modelName} content...`);
+        setExtractingModels(prev => new Set([...prev, summary.modelId]));
+        
+        try {
+          const downloadResult = await downloadCaseMarkResult(summary.workflowId, 'PDF');
+          if (downloadResult.data && downloadResult.data.length > 100) {
+            summary = { ...summary, content: downloadResult.data, needsExtraction: false };
+            
+            // Update the matter with extracted content
+            const existingSummary = matter.summaries[summary.modelId];
+            if (existingSummary) {
+              // Use actual stats from API if available, otherwise estimate
+              const hasActualStats = !!(existingSummary.inputTokens && existingSummary.inputTokens > 0 && existingSummary.costUsd && existingSummary.costUsd > 0);
+              const estimatedTokens = Math.ceil(downloadResult.data.length / 4);
+              const model = TEST_MODELS.find(m => m.id === summary.modelId);
+              const estimatedCost = model ? calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M) : 0;
+              
+              const updatedSummary = {
+                ...existingSummary,
+                content: downloadResult.data,
+                status: 'completed' as const,
+                inputTokens: hasActualStats ? existingSummary.inputTokens : estimatedTokens,
+                outputTokens: hasActualStats ? existingSummary.outputTokens : estimatedTokens,
+                totalTokens: hasActualStats ? existingSummary.totalTokens : estimatedTokens * 2,
+                costUsd: hasActualStats ? existingSummary.costUsd : estimatedCost,
+                statsEstimated: !hasActualStats,
+              };
+              
+              setMatter(prev => prev ? {
+                ...prev,
+                summaries: { ...prev.summaries, [summary.modelId]: updatedSummary },
+              } : prev);
+              saveMatter({
+                ...matter,
+                summaries: { ...matter.summaries, [summary.modelId]: updatedSummary },
+              });
+            }
+            
+            const statsLabel = existingSummary?.statsEstimated ? ' (stats estimated)' : '';
+            addLogEntry('success', `   └─ ${summary.modelName}: ${downloadResult.data.length.toLocaleString()} chars extracted${statsLabel}`);
+          } else {
+            addLogEntry('error', `   └─ ${summary.modelName}: Extraction failed or empty content`);
+            setExtractingModels(prev => { const next = new Set(prev); next.delete(summary.modelId); return next; });
+            setAnalyzingModels(prev => { const next = new Set(prev); next.delete(summary.modelId); return next; });
+            continue; // Skip this summary
+          }
+        } catch (error) {
+          addLogEntry('error', `   └─ ${summary.modelName}: ${error instanceof Error ? error.message : 'Extraction error'}`);
+          setExtractingModels(prev => { const next = new Set(prev); next.delete(summary.modelId); return next; });
+          setAnalyzingModels(prev => { const next = new Set(prev); next.delete(summary.modelId); return next; });
+          continue; // Skip this summary
+        }
+        
+        setExtractingModels(prev => { const next = new Set(prev); next.delete(summary.modelId); return next; });
+      }
 
       // Check if we have a control summary to compare against
       const hasControl = !!matter.controlSummary?.content;
@@ -714,7 +1292,8 @@ ${matter.controlSummary!.content}`;
 
       try {
         console.log(`[Quality Analysis] Starting analysis for ${summary.modelId}${hasControl ? ' (with control comparison)' : ''}`);
-        addLogEntry('info', `Analyzing ${summary.modelName} with GPT-5.2...`);
+        addLogEntry('info', `🤖 QUALITY ANALYSIS: ${summary.modelName} (${i + 1}/${summariesToAnalyze.length})`);
+        addLogEntry('info', `   └─ Sending to GPT-5.2 Judge for evaluation...`);
         
         const result = await createChatCompletion(JUDGE_MODEL.id, [
           { role: 'system', content: analysisPrompt },
@@ -829,7 +1408,7 @@ ${matter.controlSummary!.content}`;
             };
             
             console.log(`[Quality Analysis] Successfully created score for ${summary.modelId}:`, overallScore, hasControl ? '(vs control)' : '');
-            addLogEntry('success', `${summary.modelName} scored ${overallScore}/100`);
+            addLogEntry('success', `   └─ ✅ ${summary.modelName}: Score ${overallScore}/100 (analysis cost: $${analysisCost.toFixed(4)})`);
           } catch (parseError) {
             console.error(`[Quality Analysis] JSON parse error for ${summary.modelId}:`, parseError);
             console.error(`[Quality Analysis] Raw content:`, content.substring(0, 500));
@@ -842,6 +1421,13 @@ ${matter.controlSummary!.content}`;
       } catch (error) {
         console.error('[Quality Analysis] API error for', summary.modelId, error);
         addLogEntry('error', `API error analyzing ${summary.modelName}`);
+      } finally {
+        // Remove model from analyzing set
+        setAnalyzingModels(prev => {
+          const next = new Set(prev);
+          next.delete(summary.modelId);
+          return next;
+        });
       }
     }
 
@@ -868,11 +1454,21 @@ ${matter.controlSummary!.content}`;
     });
     updateMatter(finalUpdate);
     
+    // Clear analysis tracking state
     setRunningAnalysis(false);
+    setAnalyzingModels(new Set());
+    setExtractingModels(new Set());
+    setAnalysisProgress(null);
+    setAnalysisModelId(null); // Clear the current model being analyzed
+    setCurrentModelStartTime(null); // Clear timer
     
     // Notify user
     const scoreCount = Object.keys(qualityScores).length;
-    addLogEntry('success', `Quality analysis complete: ${scoreCount} summaries scored`);
+    addLogEntry('success', `✅ Quality analysis complete: ${scoreCount} summaries scored`);
+    
+    // Clear activity banner AFTER the log entry (since addLogEntry sets it)
+    setCurrentActivity('');
+    
     if (scoreCount > 0) {
       toast({
         title: "Analysis Complete",
@@ -1120,6 +1716,21 @@ ${matter.controlSummary!.content}`;
 
   const startProcessing = async () => {
     if (!matter) return;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DETAILED STATE LOGGING AT START OF PROCESSING
+    // ═══════════════════════════════════════════════════════════════════════════
+    console.log('[startProcessing] ═══════════════════════════════════════════');
+    console.log('[startProcessing] STARTING PROCESSING');
+    console.log('[startProcessing] Matter Status:', matter.status);
+    console.log('[startProcessing] Existing Summaries:', Object.entries(matter.summaries || {}).map(([modelId, s]) => ({
+      model: modelId,
+      status: s.status,
+      hasContent: !!s.content && s.content.length > 100,
+      contentLength: s.content?.length || 0,
+    })));
+    console.log('[startProcessing] Models to Test:', matter.modelsToTest);
+    console.log('[startProcessing] ═══════════════════════════════════════════');
 
     // Add separator if there's existing log, don't clear
     setShowProcessingLog(true); // Auto-show the log when starting
@@ -1574,36 +2185,37 @@ ${matter.controlSummary!.content}`;
           return;
         }
         
-        addLogEntry('info', '📄 Starting text extraction in background (for quality analysis)');
+        addLogEntry('info', '📄 Starting Gemini Vision extraction in background (for quality analysis)');
         
         textExtractionPromise = (async () => {
           try {
-            const { extractTextFromVaultObject } = await import('@/lib/case-api');
+            // Use Gemini Vision for more accurate legal document extraction
+            const { extractVaultObjectWithGemini } = await import('@/lib/case-api');
             
-            const extractResult = await extractTextFromVaultObject(
+            const extractResult = await extractVaultObjectWithGemini(
               vaultId!,
               objectId!,
               (status) => {
                 // Update doc status but don't block main flow
                 updateDocStatus('source', { 
                   status: 'extracting', 
-                  detail: `Extracting: ${status}` 
+                  detail: `Gemini: ${status}` 
                 });
               }
             );
             
             if (extractResult.error || !extractResult.data) {
-              addLogEntry('error', `Text extraction failed: ${extractResult.error}`);
+              addLogEntry('error', `Gemini Vision extraction failed: ${extractResult.error}`);
               return null;
             }
             
             const extractedContent = extractResult.data.content;
-            addLogEntry('success', `✅ Text extracted: ${extractedContent.length.toLocaleString()} chars`);
+            addLogEntry('success', `✅ Gemini Vision extracted: ${extractedContent.length.toLocaleString()} chars`);
             
             // Update doc status
             updateDocStatus('source', { 
               status: 'completed', 
-              detail: 'Text extracted',
+              detail: 'Gemini Vision extracted',
               charCount: extractedContent.length,
               pageCount: extractResult.data.pageCount
             });
@@ -1621,17 +2233,25 @@ ${matter.controlSummary!.content}`;
             return extractedContent;
           } catch (error) {
             const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-            addLogEntry('error', `Text extraction exception: ${errorMsg}`);
+            addLogEntry('error', `Gemini Vision extraction exception: ${errorMsg}`);
             return null;
           }
         })();
       };
 
       // ═══════════════════════════════════════════════════════════════════════════
-      // STEP 1: Submit ALL jobs to CaseMark in parallel (don't wait for completion)
+      // SEQUENTIAL JOB PROCESSING - Submit one job, wait for completion, then next
+      // This is the most efficient approach - no queue contention!
       // ═══════════════════════════════════════════════════════════════════════════
+      console.log('[Sequential] ═══════════════════════════════════════════');
+      console.log('[Sequential] Starting sequential processing for', totalModels, 'models');
+      console.log('[Sequential] Models:', modelsToRun.map(m => m.name));
+      console.log('[Sequential] Existing summaries in state:', Object.keys(summaries));
+      console.log('[Sequential] ═══════════════════════════════════════════');
+      
       addLogEntry('info', `═══════════════════════════════════════`);
-      addLogEntry('info', `🚀 Submitting ${totalModels} jobs to CaseMark in parallel`);
+      addLogEntry('info', `🚀 Processing ${totalModels} models SEQUENTIALLY`);
+      addLogEntry('info', `   (Submit → Wait → Download → Next)`);
       addLogEntry('info', `═══════════════════════════════════════`);
       
       // Check for document URL first
@@ -1641,35 +2261,93 @@ ${matter.controlSummary!.content}`;
         throw new Error(errorMsg);
       }
       
-      // Import the submit function
-      const { submitCaseMarkWorkflow, getCaseMarkWorkflowStatus } = await import('@/lib/case-api');
+      // Import the functions we need
+      const { submitCaseMarkWorkflow, getCaseMarkWorkflowStatus, downloadCaseMarkResult } = await import('@/lib/case-api');
       
-      // Submit all jobs in parallel
-      const submitPromises = modelsToRun.map(async (model, i) => {
-        if (cancelRequestedRef.current) return null;
+      // Start text extraction in background immediately
+      if (!textExtractionStarted) {
+        startTextExtractionInBackground();
+      }
+      
+      // Track analysis - will run after each summary completes
+      const analyzedModels = new Set<string>();
+      const qualityScores: Record<string, QualityScore> = {};
+      
+      // Process each model SEQUENTIALLY
+      let completedCount = 0;
+      const INITIAL_WAIT_SECONDS = 45; // Wait 45s before first poll
+      const POLL_INTERVAL_MS = 3000;   // Poll every 3s after that
+      const MAX_POLL_TIME_MS = 10 * 60 * 1000; // 10 min max per model
+      
+      for (let i = 0; i < modelsToRun.length; i++) {
+        const model = modelsToRun[i];
         
-        const sourceFilename = matter.sourceDocuments[0]?.filename || 'document';
-        addLogEntry('info', `[${i + 1}/${totalModels}] Submitting ${model.name}...`);
+        if (cancelRequestedRef.current) {
+          addLogEntry('warning', '⚠️ Processing cancelled by user');
+          break;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // CHECK: Skip if this model already has a completed summary with content
+        // ═══════════════════════════════════════════════════════════════════════
+        const existingSummary = summaries[model.id];
+        if (existingSummary?.status === 'completed' && existingSummary?.content && existingSummary.content.length > 100) {
+          addLogEntry('info', `═══════════════════════════════════════`);
+          addLogEntry('info', `⏭️ [${i + 1}/${totalModels}] ${model.name} - ALREADY COMPLETE`);
+          addLogEntry('info', `   └─ ${existingSummary.content.length.toLocaleString()} chars from previous run`);
+          addLogEntry('info', `═══════════════════════════════════════`);
+          completedCount++;
+          continue; // Skip to next model
+        }
+        
+        addLogEntry('info', `═══════════════════════════════════════`);
+        addLogEntry('info', `📤 [${i + 1}/${totalModels}] ${model.name}`);
+        addLogEntry('info', `═══════════════════════════════════════`);
+        
+        updateStep('summarize', { 
+          progress: Math.round((i / totalModels) * 100),
+          detail: `[${i + 1}/${totalModels}] Submitting ${model.name}...`
+        });
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP A: Submit the job
+        // ═══════════════════════════════════════════════════════════════════════
+        const submitStartTime = Date.now();
+        let workflowId: string | null = null;
         
         try {
+          addLogEntry('info', `   📤 Submitting to CaseMark...`);
           const result = await submitCaseMarkWorkflow(
             workflowType,
             [documentUrl],
             model.id,
             `${matter.name} - ${model.name}`,
-            (status) => addLogEntry('info', `   └─ ${model.name}: ${status}`)
+            (status) => addLogEntry('info', `      └─ ${status}`)
           );
           
           if (result.error || !result.data?.workflowId) {
-            addLogEntry('error', `   └─ ${model.name} submit failed: ${result.error}`);
-            return { model, workflowId: null, error: result.error };
+            addLogEntry('error', `   ❌ Submit failed: ${result.error}`);
+            summaries[model.id] = {
+              model: model.id,
+              content: '',
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+              elapsedTimeMs: 0,
+              costUsd: 0,
+              createdAt: new Date().toISOString(),
+              status: 'error',
+              error: result.error || 'Submit failed',
+            };
+            updateMatter({ summaries: { ...summaries } });
+            continue; // Move to next model
           }
           
-          const workflowId = result.data.workflowId;
-          addLogEntry('success', `   └─ ${model.name} queued: ${workflowId}`);
+          workflowId = result.data.workflowId;
+          addLogEntry('success', `   ✓ Queued: ${workflowId}`);
           
           // Save workflow ID immediately
-          const partialSummary: SummaryResult = {
+          summaries[model.id] = {
             model: model.id,
             content: '',
             inputTokens: 0,
@@ -1682,40 +2360,13 @@ ${matter.controlSummary!.content}`;
             casemarkWorkflowId: workflowId,
             casemarkStartedAt: new Date().toISOString(),
           };
+          updateMatter({ summaries: { ...summaries } });
           
-          summaries[model.id] = partialSummary;
-          
-          return { model, workflowId, error: null };
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-          addLogEntry('error', `   └─ ${model.name} exception: ${errorMsg}`);
-          return { model, workflowId: null, error: errorMsg };
-        }
-      });
-      
-      // Wait for all submissions
-      const submissions = await Promise.all(submitPromises);
-      
-      // Save initial state with all workflow IDs
-      updateMatter({ summaries: { ...summaries } });
-      
-      // Start text extraction in background now that jobs are queued
-      if (!textExtractionStarted) {
-        startTextExtractionInBackground();
-      }
-      
-      // Count successful submissions
-      const successfulSubmissions = submissions.filter(s => s?.workflowId);
-      addLogEntry('info', `═══════════════════════════════════════`);
-      addLogEntry('info', `✓ ${successfulSubmissions.length}/${totalModels} jobs queued on CaseMark`);
-      addLogEntry('info', `═══════════════════════════════════════`);
-      
-      // Mark failed submissions as errors
-      for (const submission of submissions) {
-        if (!submission) continue;
-        if (!submission.workflowId && submission.error) {
-          summaries[submission.model.id] = {
-            model: submission.model.id,
+          addLogEntry('error', `   ❌ Submit exception: ${errorMsg}`);
+          summaries[model.id] = {
+            model: model.id,
             content: '',
             inputTokens: 0,
             outputTokens: 0,
@@ -1724,34 +2375,159 @@ ${matter.controlSummary!.content}`;
             costUsd: 0,
             createdAt: new Date().toISOString(),
             status: 'error',
-            error: submission.error,
+            error: errorMsg,
           };
+          updateMatter({ summaries: { ...summaries } });
+          continue; // Move to next model
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP B: Wait 45 seconds before first poll
+        // ═══════════════════════════════════════════════════════════════════════
+        addLogEntry('info', `   ⏳ Waiting ${INITIAL_WAIT_SECONDS}s before first status check...`);
+        
+        for (let remaining = INITIAL_WAIT_SECONDS; remaining > 0; remaining -= 5) {
+          if (cancelRequestedRef.current) break;
+          updateStep('summarize', { 
+            detail: `[${i + 1}/${totalModels}] ${model.name}: Waiting ${remaining}s...`
+          });
+          await new Promise(resolve => setTimeout(resolve, Math.min(5000, remaining * 1000)));
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP C: Poll until complete (every 3s)
+        // ═══════════════════════════════════════════════════════════════════════
+        addLogEntry('info', `   🔍 Polling every ${POLL_INTERVAL_MS / 1000}s...`);
+        const pollStartTime = Date.now();
+        let isComplete = false;
+        let summaryContent = '';
+        let actualStats: { inputTokens?: number; outputTokens?: number; totalTokens?: number; costUsd?: number; durationMs?: number } = {};
+        
+        while (!isComplete && (Date.now() - pollStartTime) < MAX_POLL_TIME_MS) {
+          if (cancelRequestedRef.current) break;
+          
+          try {
+            // Check status using getCaseMarkWorkflowStatus (non-blocking)
+            const statusResult = await getCaseMarkWorkflowStatus(workflowId);
+            
+            if (statusResult.error) {
+              addLogEntry('warning', `      └─ Status check error: ${statusResult.error}`);
+              // Don't break - might be transient
+            } else if (statusResult.data?.status === 'COMPLETED') {
+              addLogEntry('success', `   ✅ CaseMark COMPLETED!`);
+              isComplete = true;
+              
+              // Capture timing from CaseMark
+              if (statusResult.data?.durationMs) {
+                actualStats.durationMs = statusResult.data.durationMs;
+              }
+              
+              // Now download the actual content
+              addLogEntry('info', `   📥 Downloading result...`);
+              updateStep('summarize', { 
+                detail: `[${i + 1}/${totalModels}] ${model.name}: Downloading...`
+              });
+              
+              const downloadResult = await downloadCaseMarkResult(workflowId, 'PDF');
+              
+              if (downloadResult.error) {
+                addLogEntry('error', `   ❌ Download failed: ${downloadResult.error}`);
+                summaries[model.id] = {
+                  ...summaries[model.id],
+                  status: 'error',
+                  error: downloadResult.error,
+                };
+              } else if (downloadResult.data && downloadResult.data.length > 0) {
+                summaryContent = downloadResult.data;
+                addLogEntry('success', `   ✅ Downloaded ${summaryContent.length.toLocaleString()} chars`);
+              } else {
+                addLogEntry('error', `   ❌ Download returned empty content`);
+                summaries[model.id] = {
+                  ...summaries[model.id],
+                  status: 'error',
+                  error: 'Empty download',
+                };
+              }
+              
+            } else if (statusResult.data?.status === 'FAILED' || statusResult.data?.status === 'CANCELLED') {
+              addLogEntry('error', `   ❌ CaseMark ${statusResult.data.status}`);
+              summaries[model.id] = {
+                ...summaries[model.id],
+                status: 'error',
+                error: `CaseMark ${statusResult.data.status}`,
+              };
+              updateMatter({ summaries: { ...summaries } });
+              break; // Exit poll loop
+              
+            } else {
+              // Still running - show the actual status from CaseMark API
+              const casemarkStatus = statusResult.data?.status || 'Processing';
+              const elapsed = Math.round((Date.now() - submitStartTime) / 1000);
+              updateStep('summarize', { 
+                detail: `[${i + 1}/${totalModels}] ${model.name}: ${casemarkStatus}... (${elapsed}s)`
+              });
+            }
+            
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+            addLogEntry('warning', `      └─ Poll exception: ${errorMsg}`);
+          }
+          
+          if (!isComplete) {
+            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+          }
+        }
+        
+        // Check for timeout
+        if (!isComplete && (Date.now() - pollStartTime) >= MAX_POLL_TIME_MS) {
+          addLogEntry('error', `   ❌ Timed out after ${MAX_POLL_TIME_MS / 60000} minutes`);
+          summaries[model.id] = {
+            ...summaries[model.id],
+            status: 'error',
+            error: 'Timeout waiting for CaseMark',
+          };
+          updateMatter({ summaries: { ...summaries } });
+          continue; // Move to next model
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP D: Save completed summary
+        // ═══════════════════════════════════════════════════════════════════════
+        if (summaryContent && summaryContent.length > 0) {
+          const totalElapsedMs = Date.now() - submitStartTime;
+          const estimatedTokens = Math.ceil(summaryContent.length / 4);
+          const estimatedCost = calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M);
+          
+          summaries[model.id] = {
+            ...summaries[model.id],
+            content: summaryContent,
+            inputTokens: actualStats.inputTokens || estimatedTokens,
+            outputTokens: actualStats.outputTokens || estimatedTokens,
+            totalTokens: actualStats.totalTokens || estimatedTokens * 2,
+            costUsd: actualStats.costUsd || estimatedCost,
+            elapsedTimeMs: actualStats.durationMs || totalElapsedMs,
+            status: 'completed',
+            statsEstimated: !actualStats.costUsd,
+          };
+          updateMatter({ summaries: { ...summaries } });
+          completedCount++;
+          
+          addLogEntry('success', `   ✓ ${model.name} complete: ${summaryContent.length.toLocaleString()} chars in ${Math.round(totalElapsedMs / 1000)}s`);
         }
       }
-      updateMatter({ summaries: { ...summaries } });
+      
+      // All models processed
+      addLogEntry('info', `═══════════════════════════════════════`);
+      addLogEntry('info', `✓ ${completedCount}/${totalModels} summaries generated`);
+      addLogEntry('info', `═══════════════════════════════════════`);
+      
+      updateStep('summarize', { status: 'completed', progress: 100 });
       
       // ═══════════════════════════════════════════════════════════════════════════
-      // UNIFIED POLL + ANALYZE LOOP - Start analysis IMMEDIATELY when summaries complete
+      // STEP 3: Quality Analysis (run for all completed summaries)
       // ═══════════════════════════════════════════════════════════════════════════
-      addLogEntry('info', `⚡ Fast polling ${successfulSubmissions.length} jobs (analysis starts immediately on completion)...`);
       
-      const pollInterval = 1500; // 1.5 seconds - FAST polling!
-      const maxPollTime = 20 * 60 * 1000; // 20 minutes max
-      const pollStartTime = Date.now();
-      
-      // Track which jobs are still pending
-      const pendingJobs = new Map(
-        successfulSubmissions
-          .filter(s => s?.workflowId)
-          .map(s => [s!.model.id, { model: s!.model, workflowId: s!.workflowId!, startTime: Date.now() }])
-      );
-      
-      // Track analysis - start immediately when summaries complete
-      const analyzedModels = new Set<string>();
-      const qualityScores: Record<string, QualityScore> = {};
-      const analysisPromises: Promise<void>[] = [];
-      
-      // Start analysis phase UI immediately
+      // Start analysis phase UI
       setCurrentPhase('analyze');
       updateStep('analyze', { status: 'running', progress: 0 });
       updateMatter({ status: 'analyzing' });
@@ -1768,50 +2544,85 @@ ${matter.controlSummary!.content}`;
         });
       }
       
-      // Helper to extract text and analyze a single summary
-      const extractAndAnalyze = async (summary: SummaryResult) => {
+      // Helper to extract text and analyze a single summary with timeout
+      const extractAndAnalyze = async (summary: SummaryResult): Promise<void> => {
         const modelId = summary.model;
         const model = TEST_MODELS.find(m => m.id === modelId);
         const modelName = model?.name || modelId;
         
-        if (analyzedModels.has(modelId)) return;
+        if (analyzedModels.has(modelId)) {
+          addLogEntry('info', `⏭️ ${modelName} already analyzed, skipping`);
+          return;
+        }
         analyzedModels.add(modelId);
         
-        // Step 1: Extract text if needed
+        // Step 1: Extract text if needed (with timeout)
         let summaryContent = summary.content;
-        if (summary.status === 'completed_no_download' && summary.casemarkWorkflowId) {
-          addLogEntry('info', `📥 Extracting ${modelName}...`);
+        const workflowId = summary.casemarkWorkflowId;
+        
+        if ((summary.status === 'completed_no_download' || !summaryContent || summaryContent.length < 100) && workflowId) {
+          addLogEntry('info', `📥 Auto-downloading ${modelName}...`);
+          
+          // Create a timeout promise - increased to 5 minutes since Vault extraction can take a while
+          const timeoutMs = 300000; // 5 minute timeout for download + text extraction
+          const timeoutPromise = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error(`Download timeout after ${timeoutMs/1000}s`)), timeoutMs)
+          );
+          
           try {
             const { downloadCaseMarkResult } = await import('@/lib/case-api');
-            const downloadResult = await downloadCaseMarkResult(summary.casemarkWorkflowId!, 'PDF');
+            const downloadResult = await Promise.race([
+              downloadCaseMarkResult(workflowId, 'PDF'),
+              timeoutPromise
+            ]);
+            
+            if (downloadResult.error) {
+              addLogEntry('error', `   └─ ${modelName}: Download error: ${downloadResult.error}`);
+              // Mark as error so we don't retry forever
+              summaries[modelId] = { ...summaries[modelId], status: 'error', error: downloadResult.error };
+              updateMatter({ summaries: { ...summaries } });
+              return;
+            }
+            
             if (downloadResult.data && downloadResult.data.length > 0) {
               summaryContent = downloadResult.data;
+              // Use actual stats from summary if available, otherwise estimate
+              const hasActualStats = !!(summary.inputTokens && summary.inputTokens > 0 && summary.costUsd && summary.costUsd > 0);
               const estimatedTokens = Math.ceil(summaryContent.length / 4);
-              const cost = model ? calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M) : 0;
+              const estimatedCost = model ? calculateCost(estimatedTokens, estimatedTokens, model.inputPricePer1M, model.outputPricePer1M) : 0;
               
               summaries[modelId] = {
-                ...summary,
+                ...summaries[modelId], // Use current state, not stale summary param
                 content: summaryContent,
-                inputTokens: estimatedTokens,
-                outputTokens: estimatedTokens,
-                totalTokens: estimatedTokens * 2,
-                costUsd: cost,
+                inputTokens: hasActualStats ? summary.inputTokens : estimatedTokens,
+                outputTokens: hasActualStats ? summary.outputTokens : estimatedTokens,
+                totalTokens: hasActualStats ? summary.totalTokens : estimatedTokens * 2,
+                costUsd: hasActualStats ? summary.costUsd : estimatedCost,
                 status: 'completed',
+                statsEstimated: !hasActualStats,
               };
               updateMatter({ summaries: { ...summaries } });
-              addLogEntry('success', `   └─ ${modelName}: ${summaryContent.length.toLocaleString()} chars`);
+              addLogEntry('success', `   └─ ${modelName}: Downloaded ${summaryContent.length.toLocaleString()} chars${!hasActualStats ? ' (stats estimated)' : ''}`);
             } else {
-              addLogEntry('error', `   └─ ${modelName}: extraction failed`);
+              addLogEntry('error', `   └─ ${modelName}: Download returned empty content`);
+              summaries[modelId] = { ...summaries[modelId], status: 'error', error: 'Empty download' };
+              updateMatter({ summaries: { ...summaries } });
               return;
             }
           } catch (error) {
-            addLogEntry('error', `   └─ ${modelName}: ${error instanceof Error ? error.message : 'Error'}`);
+            const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+            addLogEntry('error', `   └─ ${modelName}: Download failed: ${errorMsg}`);
+            summaries[modelId] = { ...summaries[modelId], status: 'error', error: errorMsg };
+            updateMatter({ summaries: { ...summaries } });
             return;
           }
+        } else if (!workflowId) {
+          addLogEntry('error', `   └─ ${modelName}: No workflow ID - cannot download`);
+          return;
         }
         
         if (!summaryContent || summaryContent.length < 100) {
-          addLogEntry('warning', `   └─ ${modelName}: No content to analyze`);
+          addLogEntry('warning', `   └─ ${modelName}: Content too short (${summaryContent?.length || 0} chars) - skipping analysis`);
           return;
         }
         
@@ -1890,85 +2701,40 @@ ${matter.controlSummary!.content}`;
       };
       
       // ═══════════════════════════════════════════════════════════════════════════
-      // SINGLE UNIFIED LOOP: Poll + Extract + Analyze in parallel
+      // SEQUENTIAL QUALITY ANALYSIS - Analyze all completed summaries
       // ═══════════════════════════════════════════════════════════════════════════
       
-      // Start analyzing any summaries that are already complete
-      const alreadyComplete = Object.values(summaries).filter(
-        s => (s.status === 'completed' || s.status === 'completed_no_download') && s.casemarkWorkflowId
+      // Get all completed summaries that need analysis
+      const summariesForAnalysis = Object.values(summaries).filter(
+        s => s.status === 'completed' && s.content && s.content.length > 100
       );
       
-      if (alreadyComplete.length > 0) {
-        addLogEntry('info', `⚡ ${alreadyComplete.length} summaries already complete - starting analysis immediately`);
-        for (const summary of alreadyComplete) {
-          analysisPromises.push(extractAndAnalyze(summary));
-        }
-      }
+      addLogEntry('info', `═══════════════════════════════════════`);
+      addLogEntry('info', `🔬 Analyzing ${summariesForAnalysis.length} summaries with GPT-5.2`);
+      addLogEntry('info', `═══════════════════════════════════════`);
       
-      // Poll remaining jobs while analysis runs in parallel
-      while (pendingJobs.size > 0 && !cancelRequestedRef.current) {
-        if (Date.now() - pollStartTime > maxPollTime) {
-          addLogEntry('warning', `⏱️ Polling timeout - ${pendingJobs.size} jobs still running`);
-          break;
-        }
+      // Run analysis sequentially for each summary
+      for (let i = 0; i < summariesForAnalysis.length; i++) {
+        if (cancelRequestedRef.current) break;
         
-        // Update progress (combining generation + analysis)
-        const genComplete = totalModels - pendingJobs.size;
-        const analyzed = Object.keys(qualityScores).length;
-        updateStep('summarize', { progress: Math.round((genComplete / totalModels) * 100), detail: `${genComplete}/${totalModels} generated` });
-        updateStep('analyze', { progress: Math.round((analyzed / totalModels) * 100), detail: `${analyzed}/${totalModels} analyzed` });
+        const summary = summariesForAnalysis[i];
+        const model = TEST_MODELS.find(m => m.id === summary.model);
+        const modelName = model?.name || summary.model;
         
-        // Poll pending jobs
-        const pollPromises = Array.from(pendingJobs.entries()).map(async ([modelId, job]) => {
-          try {
-            const status = await getCaseMarkWorkflowStatus(job.workflowId);
-            return { modelId, job, status: status.data?.status, error: status.error };
-          } catch (error) {
-            return { modelId, job, status: null, error: error instanceof Error ? error.message : 'Poll error' };
-          }
+        updateStep('analyze', { 
+          progress: Math.round((i / summariesForAnalysis.length) * 100),
+          detail: `[${i + 1}/${summariesForAnalysis.length}] Analyzing ${modelName}...`
         });
         
-        const pollResults = await Promise.all(pollPromises);
-        
-        for (const result of pollResults) {
-          const { modelId, job, status } = result;
-          const elapsedTime = Date.now() - job.startTime;
-          
-          if (status === 'COMPLETED') {
-            addLogEntry('success', `✅ ${job.model.name} COMPLETED`, `${(elapsedTime / 1000).toFixed(0)}s`);
-            
-            summaries[modelId] = {
-              ...summaries[modelId],
-              elapsedTimeMs: elapsedTime,
-              status: 'completed_no_download',
-              casemarkStatus: 'COMPLETED',
-            };
-            pendingJobs.delete(modelId);
-            updateMatter({ summaries: { ...summaries } });
-            
-            // Immediately start extraction + analysis for this summary
-            analysisPromises.push(extractAndAnalyze(summaries[modelId]));
-            
-            setJustCompletedModelId(modelId);
-            setTimeout(() => setJustCompletedModelId(null), 1500);
-            
-          } else if (status === 'FAILED' || status === 'CANCELLED') {
-            addLogEntry('error', `❌ ${job.model.name} ${status}`);
-            summaries[modelId] = { ...summaries[modelId], status: 'error', error: `Workflow ${status.toLowerCase()}`, casemarkStatus: status };
-            pendingJobs.delete(modelId);
-          }
-        }
-        
-        updateMatter({ summaries: { ...summaries } });
-        
-        if (pendingJobs.size > 0) {
-          await new Promise(resolve => setTimeout(resolve, pollInterval));
-        }
+        await extractAndAnalyze(summary);
       }
       
-      // Wait for all analysis to complete
-      addLogEntry('info', `⏳ Waiting for ${analysisPromises.length} analyses to complete...`);
-      await Promise.all(analysisPromises);
+      updateStep('analyze', { 
+        progress: 100,
+        detail: `${Object.keys(qualityScores).length}/${summariesForAnalysis.length} analyzed`
+      });
+      
+      addLogEntry('info', `✅ Quality analysis complete: ${Object.keys(qualityScores).length} summaries scored`);
 
       // Clear current model tracking
       setCurrentModelId(null);
@@ -2021,13 +2787,13 @@ ${matter.controlSummary!.content}`;
         updateMatter({ qualityScores: { ...qualityScores } });
       }
       
-      const completedCount = Object.values(summaries).filter(s => s.status === 'completed').length;
+      const finalCompletedCount = Object.values(summaries).filter(s => s.status === 'completed').length;
       const failedCount = Object.values(summaries).filter(s => s.status === 'error').length;
-      debugLogger.info(`📊 Processing complete`, { completed: completedCount, failed: failedCount, analyzed: Object.keys(qualityScores).length }, 'processing');
+      debugLogger.info(`📊 Processing complete`, { completed: finalCompletedCount, failed: failedCount, analyzed: Object.keys(qualityScores).length }, 'processing');
       
       addLogEntry('info', `═══════════════════════════════════════`);
       addLogEntry('info', `🎉 All processing complete!`);
-      addLogEntry('info', `   Summaries: ${completedCount} completed, ${failedCount} failed`);
+      addLogEntry('info', `   Summaries: ${finalCompletedCount} completed, ${failedCount} failed`);
       addLogEntry('info', `   Analyses: ${Object.keys(qualityScores).length} scored`);
       addLogEntry('info', `═══════════════════════════════════════`);
 
@@ -2770,15 +3536,46 @@ ${controlContent}`;
         ? TEST_MODELS.filter((m) => matter.modelsToTest!.includes(m.id))
         : TEST_MODELS;
       
+      // Find control model for cost comparisons
+      const controlModel = TEST_MODELS.find(m => m.isControl);
+      const controlSummary = controlModel ? matter.summaries[controlModel.id] : null;
+      const controlScore = controlModel ? matter.qualityScores[controlModel.id] : null;
+      const controlCost = controlSummary?.costUsd || 0;
+      
       const resultsContext = selectedModels.map(model => {
         const summary = matter.summaries[model.id];
         const score = matter.qualityScores[model.id];
         
         if (!score) return null;
         
+        const cost = summary?.costUsd || 0;
+        const costVsControl = controlCost > 0 ? ((controlCost - cost) / controlCost * 100) : 0;
+        const costComparison = model.isControl 
+          ? '(BASELINE)' 
+          : costVsControl > 0 
+            ? `${costVsControl.toFixed(0)}% cheaper than Control` 
+            : costVsControl < 0 
+              ? `${Math.abs(costVsControl).toFixed(0)}% more expensive than Control`
+              : 'same as Control';
+        
+        const scoreVsControl = controlScore ? score.overallScore - controlScore.overallScore : 0;
+        const scoreComparison = model.isControl
+          ? '(BASELINE)'
+          : scoreVsControl > 0
+            ? `+${scoreVsControl.toFixed(1)} points vs Control`
+            : scoreVsControl < 0
+              ? `${scoreVsControl.toFixed(1)} points vs Control`
+              : 'same as Control';
+        
+        // Calculate value score (quality per dollar)
+        const valueScore = cost > 0 ? Math.round(score.overallScore / cost) : 0;
+        
         return `
-### ${model.name} (${model.provider})
-- **Overall Score**: ${score.overallScore}/100
+### ${model.name} (${model.provider})${model.isControl ? ' ⭐ CONTROL BASELINE' : ''}
+- **Overall Score**: ${score.overallScore}/100 ${scoreComparison}
+- **Value Score**: ${valueScore} points per dollar
+- **Cost**: $${cost.toFixed(4)} ${costComparison}${summary?.statsEstimated ? ' (estimated)' : ''}
+- **Time**: ${summary?.elapsedTimeMs ? (summary.elapsedTimeMs / 1000).toFixed(1) + 's' : 'N/A'}
 - **Factual Accuracy**: ${score.factualAccuracy?.score || 0}/100 - ${score.factualAccuracy?.rationale || 'N/A'}
 - **Citation Accuracy**: ${score.pageLineAccuracy?.score || 0}/100 - ${score.pageLineAccuracy?.rationale || 'N/A'}
 - **Relevance**: ${score.relevance?.score || 0}/100 - ${score.relevance?.rationale || 'N/A'}
@@ -2786,14 +3583,18 @@ ${controlContent}`;
 - **Legal Utility**: ${score.legalUtility?.score || 0}/100 - ${score.legalUtility?.rationale || 'N/A'}
 - **Strengths**: ${score.strengths?.join('; ') || 'None'}
 - **Weaknesses**: ${score.weaknesses?.join('; ') || 'None'}
-- **Errors**: ${score.specificErrors?.map(e => `[${e.type}] ${e.explanation}`).join('; ') || 'None'}
+- **Errors**: ${score.specificErrors?.map(e => `[${e.type}/${e.severity}] ${e.explanation}`).join('; ') || 'None'}
+- **Missing Items**: ${score.missingItems?.join('; ') || 'None'}
 - **Recommendation**: ${score.recommendation || 'N/A'}
-- **Cost**: $${summary?.costUsd?.toFixed(4) || 0}
-- **Time**: ${summary?.elapsedTimeMs ? (summary.elapsedTimeMs / 1000).toFixed(1) + 's' : 'N/A'}
 `;
       }).filter(Boolean).join('\n');
       
-      const systemPrompt = `You are an expert legal document analysis assistant. You have just analyzed multiple AI-generated summaries of a legal document and provided quality scores.
+      // Model pricing info for context
+      const modelPricing = selectedModels.map(m => 
+        `- ${m.name}: $${m.inputPricePer1M}/M input, $${m.outputPricePer1M}/M output${m.isControl ? ' (CONTROL)' : ''}`
+      ).join('\n');
+      
+      const systemPrompt = `You are an expert legal document analysis assistant (${JUDGE_MODEL.name}). You have just analyzed multiple AI-generated summaries of a legal document and provided quality scores.
 
 Here is the context of the analysis:
 
@@ -2801,10 +3602,29 @@ Here is the context of the analysis:
 **Summary Type**: ${SUMMARY_TYPE_INFO[matter.summaryType]?.label || matter.summaryType}
 **Source Document Length**: ~${matter.sourceDocuments[0]?.content?.length?.toLocaleString() || 'Unknown'} characters
 
-## Analysis Results by Model
+## Control Baseline
+The "Control" model (${controlModel?.name || 'N/A'}) represents our current production system. All cost and quality comparisons use this as the baseline.
+- Control Cost: $${controlCost.toFixed(4)}
+- Control Score: ${controlScore?.overallScore || 'N/A'}/100
+
+## Model Pricing (per million tokens)
+${modelPricing}
+
+## Analysis Results by Model (sorted by score)
 ${resultsContext}
 
-The user can now ask you follow-up questions about these results. Be specific, cite the analysis findings, and help them understand the quality differences between models. If they ask about specific errors or issues, explain in detail.`;
+**IMPORTANT CONTEXT FOR COST QUESTIONS:**
+- When a model shows "-98% cost", it means the model costs 98% LESS than the Control baseline
+- Cost savings = ((Control Cost - Model Cost) / Control Cost) × 100%
+- The Control is our current production system; we're evaluating if other models can do better for less money
+- Value Score = Quality Points / Cost in dollars (higher is better)
+
+The user can now ask you follow-up questions about these results. Be specific, cite the analysis findings, and help them understand:
+1. Quality differences between models
+2. Cost comparisons (always relative to the Control baseline)
+3. Value propositions (quality per dollar)
+4. Specific errors or issues found
+5. Which model would be best for their use case`;
 
       // Build messages array with history
       const messages = [
@@ -3277,21 +4097,36 @@ The user can now ask you follow-up questions about these results. Be specific, c
                       <FileText className="h-4 w-4" />
                       Summary Generation
                     </CardTitle>
-                    {/* Running totals */}
-                    {(totalTokensUsed > 0 || totalCostSoFar > 0) && (
-                      <div className="flex items-center gap-4 text-xs">
-                        {totalTokensUsed > 0 && (
-                          <span className="text-muted-foreground">
-                            <span className="font-mono text-blue-400">{totalTokensUsed.toLocaleString()}</span> tokens
-                          </span>
-                        )}
-                        {totalCostSoFar > 0 && (
-                          <span className="text-muted-foreground">
-                            <span className="font-mono text-green-400">${totalCostSoFar.toFixed(4)}</span> spent
-                          </span>
-                        )}
-                      </div>
-                    )}
+                    <div className="flex items-center gap-4">
+                      {/* Running totals */}
+                      {(totalTokensUsed > 0 || totalCostSoFar > 0) && (
+                        <div className="flex items-center gap-4 text-xs">
+                          {totalTokensUsed > 0 && (
+                            <span className="text-muted-foreground">
+                              <span className="font-mono text-blue-400">{totalTokensUsed.toLocaleString()}</span> tokens
+                            </span>
+                          )}
+                          {totalCostSoFar > 0 && (
+                            <span className="text-muted-foreground">
+                              <span className="font-mono text-green-400">${totalCostSoFar.toFixed(4)}</span> spent
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {/* Refresh All Button */}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={refreshAllJobs}
+                        disabled={refreshingAll}
+                        className="gap-2 text-xs h-7"
+                      >
+                        <RefreshCw className={cn("h-3 w-3", refreshingAll && "animate-spin")} />
+                        {refreshingAll && refreshProgress 
+                          ? `${refreshProgress.current}/${refreshProgress.total}: ${refreshProgress.modelName}`
+                          : 'Refresh All'}
+                      </Button>
+                    </div>
                   </div>
                 </CardHeader>
                 <CardContent>
@@ -3332,7 +4167,9 @@ The user can now ask you follow-up questions about these results. Be specific, c
                               {/* Show additional details when completed */}
                               {summary?.status === 'completed' && (
                                 <p className="text-xs text-muted-foreground">
+                                  {summary.statsEstimated && <span className="text-amber-400" title="Stats estimated - API didn't return actual usage">~</span>}
                                   {summary.inputTokens.toLocaleString()} in / {summary.outputTokens.toLocaleString()} out • {summary.content.length.toLocaleString()} chars
+                                  {summary.statsEstimated && <span className="text-amber-400 ml-1" title="Cost and token counts are estimated">(est)</span>}
                                   {!isExpanded && <span className="ml-2 text-primary">Click to preview →</span>}
                                 </p>
                               )}
@@ -3350,8 +4187,11 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                 </div>
                               ) : summary?.status === 'completed' ? (
                                 <div className="flex items-center gap-2">
-                                  <span className="text-xs font-mono text-green-400">
-                                    ${summary.costUsd.toFixed(4)}
+                                  <span 
+                                    className={cn("text-xs font-mono", summary.statsEstimated ? "text-amber-400" : "text-green-400")}
+                                    title={summary.statsEstimated ? "Estimated cost - API didn't return actual usage" : "Actual cost from CaseMark API"}
+                                  >
+                                    {summary.statsEstimated && '~'}${summary.costUsd.toFixed(4)}
                                   </span>
                                   <span className="text-xs text-muted-foreground">
                                     {formatDuration(summary.elapsedTimeMs)}
@@ -3373,17 +4213,22 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                     size="sm"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      checkWorkflowStatus(model.id);
+                                      downloadSummaryContent(model.id);
                                     }}
                                     disabled={retryingModels.has(model.id)}
-                                    className="h-6 text-xs gap-1 text-blue-400 border-blue-500/30 hover:bg-blue-500/10"
+                                    className="h-6 text-xs gap-1 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/10"
                                   >
                                     {retryingModels.has(model.id) ? (
-                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                      <>
+                                        <Loader2 className="h-3 w-3 animate-spin" />
+                                        Extracting...
+                                      </>
                                     ) : (
-                                      <Download className="h-3 w-3" />
+                                      <>
+                                        <Download className="h-3 w-3" />
+                                        Download
+                                      </>
                                     )}
-                                    Download
                                   </Button>
                                 </div>
                               ) : summary?.status === 'error' ? (
@@ -3541,7 +4386,8 @@ The user can now ask you follow-up questions about these results. Be specific, c
                     ).map((model) => {
                       const summary = matter.summaries[model.id];
                       const score = matter.qualityScores[model.id];
-                      const isCurrentlyAnalyzing = analysisModelId === model.id;
+                      // Check BOTH state variables for reliability
+                      const isCurrentlyAnalyzing = analysisModelId === model.id || analyzingModels.has(model.id);
                       
                       // Skip if summary not ready (completed or completed_no_download means ready for analysis)
                       const summaryReady = summary?.status === 'completed' || summary?.status === 'completed_no_download';
@@ -3590,14 +4436,19 @@ The user can now ask you follow-up questions about these results. Be specific, c
                             )}
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
-                            {isCurrentlyAnalyzing && !score ? (
+                            {extractingModels.has(model.id) ? (
+                              <Badge variant="outline" className="gap-1 text-xs text-amber-400 border-amber-500/30 animate-pulse">
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                                Extracting text...
+                              </Badge>
+                            ) : isCurrentlyAnalyzing && !score ? (
                               <div className="flex items-center gap-3">
                                 <span className="text-xs font-mono text-primary">
                                   {elapsedSeconds}s
                                 </span>
-                                <Badge variant="outline" className="gap-1 text-xs animate-pulse">
+                                <Badge variant="outline" className="gap-1 text-xs text-blue-400 border-blue-500/30 animate-pulse">
                                   <Loader2 className="h-3 w-3 animate-spin" />
-                                  Analyzing...
+                                  Analyzing with GPT-5.2...
                                 </Badge>
                               </div>
                             ) : score ? (
@@ -3613,6 +4464,11 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                 </span>
                                 <CheckCircle2 className="h-4 w-4 text-emerald-400" />
                               </div>
+                            ) : runningAnalysis ? (
+                              <Badge variant="outline" className="gap-1 text-xs text-muted-foreground">
+                                <Clock className="h-3 w-3" />
+                                Queued
+                              </Badge>
                             ) : (
                               <span className="text-xs text-muted-foreground">Pending</span>
                             )}
@@ -3781,7 +4637,16 @@ The user can now ask you follow-up questions about these results. Be specific, c
                 <Button
                   variant={showChat ? "default" : "outline"}
                   size="sm"
-                  onClick={() => setShowChat(!showChat)}
+                  onClick={() => {
+                    const newState = !showChat;
+                    setShowChat(newState);
+                    // Scroll chat panel into view when opening
+                    if (newState) {
+                      setTimeout(() => {
+                        document.getElementById('chat-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }, 100);
+                    }
+                  }}
                   className="gap-2"
                 >
                   <MessageSquare className="h-4 w-4" />
@@ -4683,7 +5548,7 @@ The user can now ask you follow-up questions about these results. Be specific, c
 
             {/* Chat with Judge Panel */}
             {showChat && (
-              <Card className="mt-6 border-primary/30 bg-primary/5">
+              <Card id="chat-panel" className="mt-6 border-primary/30 bg-primary/5">
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between">
                     <CardTitle className="font-serif flex items-center gap-2 text-lg">
@@ -4707,10 +5572,16 @@ The user can now ask you follow-up questions about these results. Be specific, c
                     {chatMessages.length === 0 ? (
                       <div className="h-full flex flex-col items-center justify-center text-center text-muted-foreground">
                         <MessageSquare className="h-10 w-10 mb-3 opacity-50" />
-                        <p className="text-sm font-medium">No messages yet</p>
-                        <p className="text-xs mt-1 max-w-[250px]">
-                          Ask questions like &ldquo;Why did Gemini score higher on factual accuracy?&rdquo; or &ldquo;What errors did GPT-4o make?&rdquo;
+                        <p className="text-sm font-medium">Chat with the Judge</p>
+                        <p className="text-xs mt-1 max-w-[300px]">
+                          I analyzed all {Object.keys(matter?.qualityScores || {}).length} summaries. Ask me about:
                         </p>
+                        <ul className="text-xs mt-2 text-left space-y-1">
+                          <li>• Cost comparisons vs the Control baseline</li>
+                          <li>• Why a model scored higher or lower</li>
+                          <li>• Specific errors and their severity</li>
+                          <li>• Which model offers the best value</li>
+                        </ul>
                       </div>
                     ) : (
                       <div className="space-y-4">
@@ -4775,10 +5646,12 @@ The user can now ask you follow-up questions about these results. Be specific, c
                   {chatMessages.length === 0 && (
                     <div className="flex flex-wrap gap-2">
                       {[
-                        'Why did #1 win?',
-                        'What were the key differences?',
-                        'Which model is most cost-effective?',
-                        'What errors were most serious?',
+                        'Why is the cost so different between models?',
+                        'Which model offers the best value?',
+                        'What does "-98% cost" mean?',
+                        'Why did the #1 model win?',
+                        'What were the most serious errors?',
+                        'Should we switch from the Control?',
                       ].map((q) => (
                         <Button
                           key={q}
@@ -5304,18 +6177,32 @@ The user can now ask you follow-up questions about these results. Be specific, c
                           {needsAnalysis && ` • ${analysisCount} analyzed`}
                         </CardDescription>
                       </div>
-                      {hasIncomplete && (
+                      <div className="flex items-center gap-2">
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={retryAllFailed}
-                          disabled={retryingModels.size > 0}
+                          onClick={refreshAllJobs}
+                          disabled={refreshingAll || retryingModels.size > 0}
                           className="gap-2"
                         >
-                          <RefreshCw className={cn("h-4 w-4", retryingModels.size > 0 && "animate-spin")} />
-                          Retry All Failed
+                          <RefreshCw className={cn("h-4 w-4", refreshingAll && "animate-spin")} />
+                          {refreshingAll && refreshProgress 
+                            ? `${refreshProgress.current}/${refreshProgress.total}: ${refreshProgress.modelName.substring(0, 15)}...`
+                            : 'Refresh All'}
                         </Button>
-                      )}
+                        {hasIncomplete && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={retryAllFailed}
+                            disabled={retryingModels.size > 0 || refreshingAll}
+                            className="gap-2"
+                          >
+                            <RefreshCw className={cn("h-4 w-4", retryingModels.size > 0 && "animate-spin")} />
+                            Retry Failed
+                          </Button>
+                        )}
+                      </div>
                     </div>
                   </CardHeader>
                   <CardContent>
@@ -5336,6 +6223,8 @@ The user can now ask you follow-up questions about these results. Be specific, c
                               "flex items-center gap-3 p-3 rounded-lg border",
                               summary?.status === 'completed' 
                                 ? "border-emerald-500/30 bg-emerald-500/5" 
+                                : summary?.status === 'completed_no_download'
+                                ? "border-amber-500/30 bg-amber-500/5"
                                 : summary?.status === 'error'
                                 ? "border-red-500/30 bg-red-500/5"
                                 : "border-border"
@@ -5360,6 +6249,16 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                   <Loader2 className="h-3 w-3 animate-spin" />
                                   Generating...
                                 </Badge>
+                              ) : analyzingModels.has(model.id) ? (
+                                <Badge variant="outline" className="gap-1 text-blue-400 border-blue-500/30 animate-pulse">
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                  Analyzing with GPT-5.2...
+                                </Badge>
+                              ) : extractingModels.has(model.id) ? (
+                                <Badge variant="outline" className="gap-1 text-amber-400 border-amber-500/30 animate-pulse">
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                  Extracting text...
+                                </Badge>
                               ) : summary?.status === 'completed' ? (
                                 <>
                                   <span className="text-xs text-muted-foreground">
@@ -5369,6 +6268,11 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                     <Badge variant="outline" className="text-emerald-400 border-emerald-500/30">
                                       <CheckCircle2 className="h-3 w-3 mr-1" />
                                       Analyzed
+                                    </Badge>
+                                  ) : runningAnalysis ? (
+                                    <Badge variant="outline" className="gap-1 text-muted-foreground">
+                                      <Clock className="h-3 w-3" />
+                                      Queued
                                     </Badge>
                                   ) : (
                                     <Button
@@ -5394,6 +6298,44 @@ The user can now ask you follow-up questions about these results. Be specific, c
                                   >
                                     <Download className="h-4 w-4" />
                                   </Button>
+                                </>
+                              ) : summary?.status === 'completed_no_download' ? (
+                                <>
+                                  <span className="text-xs text-muted-foreground">
+                                    {formatDuration(summary.elapsedTimeMs)}
+                                  </span>
+                                  {hasAnalysis ? (
+                                    <Badge variant="outline" className="text-emerald-400 border-emerald-500/30">
+                                      <CheckCircle2 className="h-3 w-3 mr-1" />
+                                      Analyzed
+                                    </Badge>
+                                  ) : runningAnalysis ? (
+                                    <Badge variant="outline" className="gap-1 text-amber-400 border-amber-500/30">
+                                      <Clock className="h-3 w-3" />
+                                      Queued for extraction
+                                    </Badge>
+                                  ) : (
+                                    <>
+                                      <Badge variant="outline" className="text-amber-400 border-amber-500/30">
+                                        <CheckCircle2 className="h-3 w-3 mr-1" />
+                                        CaseMark Done
+                                      </Badge>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => downloadSummaryContent(model.id)}
+                                        disabled={retryingModels.has(model.id)}
+                                        className="gap-1 text-xs text-emerald-400 border-emerald-500/30"
+                                      >
+                                        {retryingModels.has(model.id) ? (
+                                          <Loader2 className="h-3 w-3 animate-spin" />
+                                        ) : (
+                                          <Download className="h-3 w-3" />
+                                        )}
+                                        Download
+                                      </Button>
+                                    </>
+                                  )}
                                 </>
                               ) : summary?.status === 'error' ? (
                                 <>
@@ -5480,7 +6422,10 @@ The user can now ask you follow-up questions about these results. Be specific, c
                       {runningAnalysis ? (
                         <>
                           <Loader2 className="h-4 w-4 animate-spin" />
-                          Analyzing {completedCount} summaries...
+                          {analysisProgress 
+                            ? `Analyzing ${analysisProgress.currentModel} (${analysisProgress.current}/${analysisProgress.total})...`
+                            : `Analyzing ${completedCount} summaries...`
+                          }
                         </>
                       ) : (
                         <>

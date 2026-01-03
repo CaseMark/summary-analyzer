@@ -135,6 +135,8 @@ export interface SummaryResult {
   casemarkWorkflowId?: string;  // Store workflow ID to check status later
   casemarkStartedAt?: string;   // When we started the workflow
   casemarkStatus?: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMEOUT' | 'ERROR'; // Last known CaseMark status
+  // Stats source tracking
+  statsEstimated?: boolean;     // True if tokens/cost are estimated (API didn't return actual stats)
 }
 
 export interface SpecificError {
@@ -273,81 +275,94 @@ export const TEST_MODELS: ModelConfig[] = [
     id: 'casemark/default',
     name: '⭐ Control (Production)',
     provider: 'CaseMark',
-    inputPricePer1M: 0.30, // Estimate based on typical production pricing
-    outputPricePer1M: 2.50,
+    inputPricePer1M: 0.60,
+    outputPricePer1M: 5.00,
     color: '#fbbf24', // amber/gold - special control color
-    contextWindow: 1048576,
-    maxOutput: 65536,
+    contextWindow: 1000000,
+    maxOutput: 64000,
     notes: 'BASELINE: Current production output - all other models compared against this',
-    isControl: true, // Special flag to identify the control
+    isControl: true,
   },
-  // === GOOGLE MODELS ===
+
+  // === GOOGLE GEMINI MODELS ===
   {
     id: 'google/gemini-2.5-flash',
     name: 'Gemini 2.5 Flash',
     provider: 'Google',
-    inputPricePer1M: 0.30,
-    outputPricePer1M: 2.50,
+    inputPricePer1M: 0.60,
+    outputPricePer1M: 5.00,
     color: '#3b82f6', // blue
-    contextWindow: 1048576,
-    maxOutput: 65536,
-    notes: 'High-quality multimodal model with large context',
+    contextWindow: 1000000,
+    maxOutput: 64000,
+    notes: 'High-quality multimodal with 1M context',
   },
-  // === CHEAPER ALTERNATIVES ===
   {
     id: 'google/gemini-2.5-flash-lite',
     name: 'Gemini 2.5 Flash Lite',
     provider: 'Google',
-    inputPricePer1M: 0.15,
-    outputPricePer1M: 1.25,
+    inputPricePer1M: 0.20,
+    outputPricePer1M: 0.80,
     color: '#06b6d4', // cyan
     contextWindow: 1048576,
     maxOutput: 65536,
-    notes: '~50% cheaper than 2.5 Flash - best potential savings',
+    notes: '~85% cheaper than 2.5 Flash - best value candidate',
   },
   {
     id: 'google/gemini-3-flash',
     name: 'Gemini 3 Flash',
     provider: 'Google',
-    inputPricePer1M: 0.50,
-    outputPricePer1M: 3.00,
+    inputPricePer1M: 1.00,
+    outputPricePer1M: 6.00,
     color: '#a855f7', // purple
-    contextWindow: 1048576,
-    maxOutput: 65536,
-    notes: 'Newest Gemini - ~67% MORE expensive but 30% more token efficient',
+    contextWindow: 1000000,
+    maxOutput: 64000,
+    notes: 'Newest Gemini - more expensive but highly efficient',
   },
+
+  // === OPENAI GPT MODELS ===
   {
     id: 'openai/gpt-4.1-nano',
     name: 'GPT-4.1 Nano',
     provider: 'OpenAI',
-    inputPricePer1M: 0.10,
-    outputPricePer1M: 0.40,
+    inputPricePer1M: 0.20,
+    outputPricePer1M: 0.80,
     color: '#84cc16', // lime
     contextWindow: 1047576,
     maxOutput: 32768,
-    notes: 'Cheapest OpenAI option - ~67% cheaper than 2.5 Flash',
+    notes: 'Ultra-cheap OpenAI with 1M context',
   },
   {
-    id: 'openai/gpt-4o-mini',
-    name: 'GPT-4o Mini',
+    id: 'openai/gpt-4.1-mini',
+    name: 'GPT-4.1 Mini',
     provider: 'OpenAI',
-    inputPricePer1M: 0.15,
-    outputPricePer1M: 0.60,
-    color: '#10b981', // emerald
-    contextWindow: 128000,
-    maxOutput: 16384,
-    notes: 'Budget OpenAI - ~75% cheaper than 2.5 Flash',
+    inputPricePer1M: 0.80,
+    outputPricePer1M: 3.20,
+    color: '#65a30d', // darker lime
+    contextWindow: 1047576,
+    maxOutput: 32768,
+    notes: 'Balanced OpenAI option with 1M context',
   },
   {
     id: 'openai/gpt-5-nano',
     name: 'GPT-5 Nano',
     provider: 'OpenAI',
     inputPricePer1M: 0.10,
-    outputPricePer1M: 0.40,
+    outputPricePer1M: 0.80,
     color: '#f97316', // orange
-    contextWindow: 1047576,
-    maxOutput: 32768,
-    notes: 'Latest GPT-5 smallest variant - ultra-cheap with good quality',
+    contextWindow: 400000,
+    maxOutput: 128000,
+    notes: 'Cheapest GPT-5 - excellent value with 400K context',
+  },
+  {
+    id: 'openai/gpt-5-mini',
+    name: 'GPT-5 Mini',
+    provider: 'OpenAI',
+    inputPricePer1M: 0.50,
+    outputPricePer1M: 4.00,
+    color: '#ea580c', // darker orange
+    contextWindow: 400000,
+    maxOutput: 128000,
+    notes: 'Mid-tier GPT-5 with great quality/cost ratio',
   },
 ];
 
@@ -355,16 +370,17 @@ export const TEST_MODELS: ModelConfig[] = [
 export const CONTROL_MODEL = TEST_MODELS.find(m => m.isControl)!;
 
 // Judge model for quality analysis
-// Using GPT-5.2 as the evaluation model
+// Using GPT-5.2 as the evaluation model - best reasoning for analysis
 export const JUDGE_MODEL: ModelConfig = {
   id: 'openai/gpt-5.2',
   name: 'GPT-5.2',
   provider: 'OpenAI',
-  inputPricePer1M: 2.50,
-  outputPricePer1M: 10.00,
+  inputPricePer1M: 3.50,
+  outputPricePer1M: 19.00,
   color: '#ef4444', // red
-  contextWindow: 200000,
-  maxOutput: 100000,
+  contextWindow: 400000,
+  maxOutput: 128000,
+  notes: 'Premium judge model for quality analysis',
 };
 
 // Summary type prompts - used for quality analysis context

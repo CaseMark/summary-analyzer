@@ -155,10 +155,20 @@ export async function POST(request: NextRequest) {
     // If model is 'casemark/default', don't specify a model - use CaseMark's production default
     const useDefaultModel = !model || model === 'casemark/default';
     
+    // Map our model IDs to CaseMark's expected model names
+    // Our format: "google/gemini-2.5-flash" -> CaseMark format: "gemini-2.5-flash"
+    // Our format: "openai/gpt-4.1-mini" -> CaseMark format: "gpt-4.1-mini"
+    let casemarkModelId = model;
+    if (model && model.includes('/')) {
+      // Strip the provider prefix (e.g., "google/", "openai/")
+      casemarkModelId = model.split('/').pop() || model;
+    }
+    
     const requestPayload = {
       workflowType,
       ...(name && { name }),
-      ...(!useDefaultModel && { model }), // Only include model if NOT using default
+      // IMPORTANT: CaseMark uses "model_override" not "model"
+      ...(!useDefaultModel && { model_override: casemarkModelId }),
       inputs: {
         type: getInputType(workflowType),
         documentIds,                            // ✅ Document IDs from upload
@@ -169,7 +179,9 @@ export async function POST(request: NextRequest) {
     };
     
     if (useDefaultModel) {
-      log('info', `🎯 Using CaseMark default model (no model specified in request)`);
+      log('info', `🎯 Using CaseMark default model (no model_override specified)`);
+    } else {
+      log('info', `🎯 Using model_override: ${casemarkModelId} (from ${model})`);
     }
 
     // Log the FULL API request for debugging

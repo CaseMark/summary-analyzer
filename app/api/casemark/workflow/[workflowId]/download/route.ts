@@ -89,12 +89,12 @@ export async function POST(
     }
 
     // =========================================================================
-    // STEP 2: Find the PDF report document
+    // STEP 2: Find the document to download
     // =========================================================================
-    log('info', `Step 2: Finding WORKFLOW_REPORT PDF...`);
+    log('info', `Step 2: Finding document...`);
     
     // Documents include: WORKFLOW_INPUT, WORKFLOW_RESULT, WORKFLOW_REPORT
-    // We want WORKFLOW_REPORT with PDF mime type
+    // Priority: WORKFLOW_RESULT (JSON - instant text!) > WORKFLOW_REPORT (PDF)
     interface WorkflowDocument {
       id: string;
       type: string;
@@ -102,51 +102,54 @@ export async function POST(
       filename?: string;
     }
     
-    let pdfDoc: WorkflowDocument | null = null;
+    let targetDoc: WorkflowDocument | null = null;
+    let useJsonResult = false;
     
-    // First try to find WORKFLOW_REPORT with PDF
+    // FAST PATH: Try WORKFLOW_RESULT JSON first (contains text directly!)
     for (const doc of documents as WorkflowDocument[]) {
-      if (doc.type === 'WORKFLOW_REPORT' && doc.mimeType === 'application/pdf') {
-        pdfDoc = doc;
+      if (doc.type === 'WORKFLOW_RESULT' && doc.mimeType === 'application/json') {
+        targetDoc = doc;
+        useJsonResult = true;
+        log('info', `🚀 Found JSON result - will extract text instantly!`);
         break;
       }
     }
     
-    // Fallback: try any PDF document
-    if (!pdfDoc) {
+    // Fallback: WORKFLOW_REPORT PDF
+    if (!targetDoc) {
+      for (const doc of documents as WorkflowDocument[]) {
+        if (doc.type === 'WORKFLOW_REPORT' && doc.mimeType === 'application/pdf') {
+          targetDoc = doc;
+          log('info', `Using PDF report (JSON not available)`);
+          break;
+        }
+      }
+    }
+    
+    // Fallback: any PDF
+    if (!targetDoc) {
       for (const doc of documents as WorkflowDocument[]) {
         if (doc.mimeType === 'application/pdf') {
-          pdfDoc = doc;
+          targetDoc = doc;
           log('warn', `Using fallback PDF document (type: ${doc.type})`);
           break;
         }
       }
     }
-    
-    // Fallback: try WORKFLOW_RESULT
-    if (!pdfDoc) {
-      for (const doc of documents as WorkflowDocument[]) {
-        if (doc.type === 'WORKFLOW_RESULT') {
-          pdfDoc = doc;
-          log('warn', `Using WORKFLOW_RESULT document (mimeType: ${doc.mimeType})`);
-          break;
-        }
-      }
-    }
 
-    if (!pdfDoc) {
-      log('error', `No PDF report found`, { 
+    if (!targetDoc) {
+      log('error', `No document found`, { 
         availableTypes: documents.map((d: WorkflowDocument) => `${d.type}:${d.mimeType}`) 
       });
       return NextResponse.json(
-        { error: `No PDF report found. Available: ${documents.map((d: WorkflowDocument) => d.type).join(', ')}` },
+        { error: `No document found. Available: ${documents.map((d: WorkflowDocument) => d.type).join(', ')}` },
         { status: 404 }
       );
     }
 
-    const docId = pdfDoc.id;
-    const filename = pdfDoc.filename || 'summary.pdf';
-    log('info', `Found PDF document`, { docId, filename, type: pdfDoc.type });
+    const docId = targetDoc.id;
+    const filename = targetDoc.filename || (useJsonResult ? 'result.json' : 'summary.pdf');
+    log('info', `Found document`, { docId, filename, type: targetDoc.type, mimeType: targetDoc.mimeType });
 
     // =========================================================================
     // STEP 3: Get document with presigned download URL
@@ -206,10 +209,68 @@ export async function POST(
     });
 
     // =========================================================================
-    // STEP 5: Return the presigned URL - client will handle text extraction
+    // STEP 5: Process and return the content
     // =========================================================================
-    // Server-side extraction was taking 60+ seconds and timing out
-    // Instead, return URL and let client extract via separate API calls
+    
+    if (useJsonResult) {
+      // FAST PATH: JSON contains text directly - no extraction needed!
+      try {
+        const jsonData = await downloadResponse.json();
+        
+        // Extract text content from the JSON result
+        // CaseMark JSON structure typically has: result.summary, result.content, or direct text
+        let textContent = '';
+        
+        if (typeof jsonData === 'string') {
+          textContent = jsonData;
+        } else if (jsonData.result) {
+          textContent = typeof jsonData.result === 'string' 
+            ? jsonData.result 
+            : JSON.stringify(jsonData.result, null, 2);
+        } else if (jsonData.summary) {
+          textContent = jsonData.summary;
+        } else if (jsonData.content) {
+          textContent = jsonData.content;
+        } else if (jsonData.text) {
+          textContent = jsonData.text;
+        } else {
+          // Fallback: stringify the whole thing
+          textContent = JSON.stringify(jsonData, null, 2);
+        }
+        
+        log('info', `✅ JSON result extracted instantly!`, { 
+          contentLength: textContent.length,
+          preview: textContent.substring(0, 100) + '...'
+        });
+        
+        // Return text directly - no need for client-side extraction!
+        return NextResponse.json({
+          data: {
+            textContent, // Direct text - no extraction needed!
+            isJsonResult: true,
+            filename,
+            contentType: 'application/json',
+            sizeBytes: textContent.length,
+            documentId: docId,
+          }
+        });
+      } catch (jsonError) {
+        log('warn', `Failed to parse JSON, falling back to raw text`, { error: jsonError });
+        const rawText = await downloadResponse.text();
+        return NextResponse.json({
+          data: {
+            textContent: rawText,
+            isJsonResult: true,
+            filename,
+            contentType: 'text/plain',
+            sizeBytes: rawText.length,
+            documentId: docId,
+          }
+        });
+      }
+    }
+    
+    // PDF PATH: Return base64 for client-side extraction
     const pdfBuffer = await downloadResponse.arrayBuffer();
     const base64Content = Buffer.from(pdfBuffer).toString('base64');
     

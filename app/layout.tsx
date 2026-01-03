@@ -12,8 +12,10 @@ import {
   FileText,
   Github,
   ExternalLink,
+  Star,
 } from 'lucide-react';
 import { Separator } from '@/components/ui/separator';
+import { TEST_MODELS, CONTROL_MODEL } from '@/lib/types';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -101,33 +103,35 @@ export default function RootLayout({
 
                   <div className="space-y-1">
                     <div className="px-3 py-2 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
-                      Models Tested (5)
+                      Models Tested ({TEST_MODELS.length})
                     </div>
-                    <div className="px-3 py-1.5 text-xs text-muted-foreground">
-                      <div className="flex items-center gap-2 py-0.5">
-                        <div className="w-2 h-2 rounded-full bg-blue-500" />
-                        <span>Gemini 2.5 Flash</span>
-                      </div>
-                      <div className="flex items-center gap-2 py-0.5">
-                        <div className="w-2 h-2 rounded-full bg-cyan-500" />
-                        <span>Gemini 2.5 Flash Lite</span>
-                        <span className="text-[9px] text-emerald-400">-50%</span>
-                      </div>
-                      <div className="flex items-center gap-2 py-0.5">
-                        <div className="w-2 h-2 rounded-full bg-purple-500" />
-                        <span>Gemini 3 Flash</span>
-                        <span className="text-[9px] text-emerald-400">-33%</span>
-                      </div>
-                      <div className="flex items-center gap-2 py-0.5">
-                        <div className="w-2 h-2 rounded-full bg-lime-500" />
-                        <span>GPT-4.1 Nano</span>
-                        <span className="text-[9px] text-emerald-400">-33%</span>
-                      </div>
-                      <div className="flex items-center gap-2 py-0.5">
-                        <div className="w-2 h-2 rounded-full bg-emerald-500" />
-                        <span>GPT-4o Mini</span>
-                        <span className="text-[9px] text-muted-foreground/60">same</span>
-                      </div>
+                    <div className="px-3 py-1.5 text-xs text-muted-foreground space-y-0.5">
+                      {TEST_MODELS.map((model) => {
+                        const controlCost = CONTROL_MODEL.inputPricePer1M + CONTROL_MODEL.outputPricePer1M;
+                        const modelCost = model.inputPricePer1M + model.outputPricePer1M;
+                        const costDiff = Math.round(((modelCost - controlCost) / controlCost) * 100);
+                        
+                        return (
+                          <div key={model.id} className="flex items-center gap-2 py-0.5">
+                            {model.isControl ? (
+                              <Star className="w-2.5 h-2.5 text-amber-400 fill-amber-400" />
+                            ) : (
+                              <div 
+                                className="w-2 h-2 rounded-full" 
+                                style={{ backgroundColor: model.color }}
+                              />
+                            )}
+                            <span className={model.isControl ? 'text-amber-400 font-medium' : ''}>
+                              {model.name.replace('⭐ ', '')}
+                            </span>
+                            {!model.isControl && costDiff !== 0 && (
+                              <span className={`text-[9px] ${costDiff < 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {costDiff > 0 ? '+' : ''}{costDiff}%
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
 

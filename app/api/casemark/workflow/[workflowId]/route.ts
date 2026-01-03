@@ -44,6 +44,25 @@ export async function GET(
       },
     });
 
+    const contentType = response.headers.get('content-type') || '';
+    
+    // Check if CaseMark returned HTML (error page) instead of JSON
+    if (!contentType.includes('application/json')) {
+      const text = await response.text();
+      const isHtml = text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html');
+      log('error', `CaseMark returned non-JSON response`, { 
+        workflowId, 
+        status: response.status, 
+        contentType,
+        isHtml,
+        preview: text.substring(0, 200) 
+      });
+      return NextResponse.json(
+        { error: isHtml ? `CaseMark API unavailable (returned HTML error page)` : `Invalid response from CaseMark` },
+        { status: 502 }
+      );
+    }
+
     if (!response.ok) {
       const errorText = await response.text();
       log('error', `Failed to get workflow status`, { workflowId, status: response.status, error: errorText });
